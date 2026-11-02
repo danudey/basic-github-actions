@@ -60,7 +60,7 @@ jobs:
           # shellcheck disable=SC2016
           git ls-files -z '*/workflows/*.yml' \
             | xargs -0 "$RUNNER_TEMP/bin/actionlint" -format \
-              '{{range $err := .}}::error file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}%0A```%0A{{replace $err.Snippet "\\n" "%0A"}}%0A```{{"\n"}}{{end}}'
+              '{{range $err := .}}::error file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}\n{{end}}'
 
   zizmor:
     name: zizmor
