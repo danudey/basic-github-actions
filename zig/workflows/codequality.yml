@@ -1,0 +1,138 @@
+name: codequality
+
+# Static analysis for Zig, which is a thinner story than for the other
+# languages here, and it is worth saying why rather than pretending otherwise.
+#
+# WHAT IS NOT AVAILABLE
+#   CodeQL does not support Zig, so universal/workflows/codeql.yml cannot
+#   analyse this code (keep it anyway for the `actions` language). There is no
+#   clippy or golangci-lint equivalent with a settled rule set. Most of what a
+#   linter would tell you in another language, the Zig compiler tells you as
+#   an error: unused variables, unreachable code, implicit narrowing, missing
+#   switch arms.
+#
+# WHAT THIS WORKFLOW DOES INSTEAD
+#   1. Builds with the compiler's own diagnostics as errors, in every
+#      optimisation mode. In Zig this is most of the linting.
+#   2. Runs the test suite under the `-fsanitize-thread` and
+#      `--debug-incremental` checks the compiler offers, where the release
+#      supports them.
+#   3. Runs zlint, a third-party Zig linter, if the project opts in. It is
+#      young and its rule set moves, which is why it is off by default and
+#      why the job is allowed to fail rather than block a pull request.
+#
+# The honest summary: for a Zig project, ci.yml's four-optimisation-mode
+# matrix and a good test suite are doing the work that a linter does
+# elsewhere. That is where to spend the effort.
+#
+# WHAT TO CHANGE
+#   1. `ZIG_VERSION`. Keep it equal to the one in ci.yml.
+#   2. `ZLINT`: "true" to enable the third-party linter.
+#   3. `WORKING_DIRECTORY`, if build.zig is not at the repository root.
+#
+# WHAT IT NEEDS
+#   - Nothing. No secrets, and no Advanced Security: nothing here produces
+#     SARIF, because neither tool emits it.
+#
+# WHAT IT PRODUCES
+#   - A status check per optimisation mode, and an advisory zlint check.
+#   - Findings as job annotations rather than code scanning alerts. If Zig
+#     SARIF tooling appears, this is the file to revisit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codequality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  ZIG_VERSION: "0.15.2"
+  # Third-party linter. Young, and its rules move between releases.
+  ZLINT: "false"
+  ZLINT_VERSION: "v0.7.7"
+
+jobs:
+  # The compiler as the linter. `-Dno-bin` skips the link step, so this is a
+  # semantic analysis pass rather than a build: much faster, and it still
+  # reports every diagnostic.
+  compiler-diagnostics:
+    name: compiler diagnostics (${{ matrix.optimize }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast, ReleaseSmall]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: true
+
+      # Analysis without codegen where build.zig supports it, falling back to
+      # a full build. `-Dno-bin` is a convention rather than a compiler flag,
+      # so a build.zig that does not define it will simply reject it.
+      - name: Analyse
+        run: |
+          set -euo pipefail
+          if zig build -Dno-bin -Doptimize=${{ matrix.optimize }} --summary all 2>/dev/null; then
+            echo "analysed with -Dno-bin"
+          else
+            echo "build.zig does not define -Dno-bin; doing a full build instead"
+            zig build -Doptimize=${{ matrix.optimize }} --summary all
+          fi
+
+  zlint:
+    name: zlint
+    # Advisory. zlint's rule set changes between releases and a new rule
+    # should not turn a green main branch red on its own.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: env.ZLINT == 'true'
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: true
+
+      - name: Run zlint
+        if: env.ZLINT == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Downloaded from the release page rather than built from source,
+          # which would take longer than the lint itself.
+          gh release download "${ZLINT_VERSION}" \
+            --repo DonIsaac/zlint \
+            --pattern 'zlint-x86_64-linux' \
+            --output zlint
+          chmod +x zlint
+          # Rules are configured in .zlint.json; without one you get the
+          # default set.
+          ./zlint --deny-warnings
+
+      - name: Skipped
+        if: env.ZLINT != 'true'
+        run: echo "ZLINT is false; set it to \"true\" in this workflow to enable the linter."

@@ -1,0 +1,341 @@
+name: Release
+
+# Cuts a release, publishes to Maven Central, and attaches signed, attested
+# artifacts to the GitHub release.
+#
+# The shape is: release-please holds a release pull request open against main,
+# accumulating the changelog from conventional commit subjects. Merging that
+# pull request tags the release, and the tag is what unblocks the publish.
+# Nothing here runs on an ordinary merge.
+#
+# THIS IS THE ONE THAT NEEDS SECRETS
+#   Every other release workflow in this library publishes without a stored
+#   credential, because PyPI, npm, crates.io and GHCR all accept a workflow
+#   OIDC token. Maven Central does not. It needs:
+#
+#     MAVEN_CENTRAL_USERNAME    a Central Portal user token, not your
+#     MAVEN_CENTRAL_PASSWORD    account password. Generate the pair at
+#                               https://central.sonatype.com/account
+#     GPG_PRIVATE_KEY           an ASCII-armoured private key. Central
+#     GPG_PASSPHRASE            requires a detached GPG signature on every
+#                               artifact and will reject an unsigned upload.
+#
+#   Store all four as secrets on the `maven-central` environment rather than
+#   on the repository, so only this job can read them, and add a required
+#   reviewer to that environment. The GPG key is the one real long-lived
+#   secret in this library: publish its public half to keyserver.ubuntu.com,
+#   keep the private half nowhere else, and rotate it if a run is ever
+#   compromised.
+#
+#   Everything else — the SLSA provenance, the SBOM attestation, the cosign
+#   signature — still uses OIDC and needs no key.
+#
+# WHAT THE ARTIFACTS COME WITH
+#   On Maven Central:  a GPG signature per artifact, which is what Central
+#                      requires and what a Maven consumer can verify.
+#   On GitHub:         the jars, a .sigstore bundle for each, an SBOM, and a
+#                      signed SLSA provenance statement in the attestation
+#                      store.
+#
+# HOW A USER VERIFIES IT
+#   gh attestation verify ./tool-1.2.3.jar --repo OWNER/REPO
+#
+# ON PUBLISHING TO GITHUB PACKAGES INSTEAD
+#   Much simpler, and needs no secrets at all: `secrets.GITHUB_TOKEN` with
+#   `packages: write` is enough, and no GPG signature is required. The
+#   trade-off is that consumers must add your GitHub Packages repository to
+#   their settings.xml and authenticate to it, which for a public library is
+#   usually a worse deal than Central. There is a commented job at the bottom.
+#
+# WHAT TO CHANGE
+#   1. `BUILD_TOOL`: maven or gradle.
+#   2. `WORKING_DIRECTORY`, if the build file is not at the repository root.
+#   3. The `<distributionManagement>` in pom.xml, or the `publishing` block in
+#      build.gradle, to point at Central. This workflow invokes the publish;
+#      it cannot configure where it goes.
+#   4. Delete the `publish-central` job for an application that is not a
+#      library, and keep `github-release` on its own.
+#
+# WHAT IT NEEDS
+#   - release-please-config.json and .release-please-manifest.json at the
+#     repository root. See universal/ in this library for both.
+#   - Squash merging with the pull request title as the commit subject:
+#       Settings -> General -> Pull Requests -> Default commit message
+#   - The four secrets above, on a `maven-central` GitHub environment.
+#   - A public repository, or GitHub Advanced Security, for the attestations.
+#
+# WHAT IT PRODUCES
+#   - A tagged GitHub release with signed artifacts, and a Maven Central
+#     release.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # maven | gradle
+  BUILD_TOOL: "maven"
+  WORKING_DIRECTORY: "."
+  DISTRIBUTION: "temurin"
+  JAVA_VERSION: "21"
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    name: build
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: ${{ env.BUILD_TOOL }}
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          validate-wrappers: true
+
+      # Building once here, and publishing the same bytes from the jobs below,
+      # rather than letting each job build its own. Two builds of the same
+      # commit are not byte-identical unless the project is configured for
+      # reproducibility, and the whole point of an attestation is that it
+      # covers the artifact people actually received.
+      - name: Build the artifacts
+        env:
+          # Maven Central requires the source and javadoc jars alongside the
+          # main one, and will reject a release without them.
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              $cmd --batch-mode --no-transfer-progress -DskipTests \
+                package source:jar javadoc:jar
+              mkdir -p dist
+              # Everything publishable, excluding the shaded and original
+              # intermediates Maven leaves behind.
+              find . -path ./dist -prune -o \
+                -name '*.jar' -path '*/target/*' \
+                ! -name 'original-*' ! -name '*-shaded.jar' -print \
+                -exec cp {} dist/ \;
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              $cmd --no-daemon assemble javadocJar sourcesJar -x test
+              mkdir -p dist
+              find . -path ./dist -prune -o \
+                -name '*.jar' -path '*/build/libs/*' -print \
+                -exec cp {} dist/ \;
+              ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jars
+          path: ${{ env.WORKING_DIRECTORY }}/dist/
+          retention-days: 5
+
+  publish-central:
+    name: publish to Maven Central
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    # The four secrets live on this environment rather than on the
+    # repository, so only this job can read them. Add a required reviewer for
+    # a manual gate on every release.
+    environment:
+      name: maven-central
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      # setup-java writes the settings.xml that the deploy reads, and imports
+      # the GPG key into the runner's keyring. Both are needed: Central
+      # rejects an unsigned artifact and an unauthenticated upload alike.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: ${{ env.BUILD_TOOL }}
+          # The server id these credentials are written under. It has to match
+          # the id in the pom's <distributionManagement>, or Maven will look
+          # for credentials it cannot find and fail with a 401.
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: GPG_PASSPHRASE
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          validate-wrappers: true
+
+      - name: Publish
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              # -Prelease is a convention, not a requirement: put the GPG and
+              # javadoc plugin executions in a `release` profile so an
+              # ordinary local build does not need the signing key.
+              $cmd --batch-mode --no-transfer-progress -DskipTests \
+                -Prelease deploy
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              $cmd --no-daemon publishToMavenCentral -x test
+              ;;
+          esac
+
+  github-release:
+    name: sign and attach to the release
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # Uploading to the release.
+      contents: write
+      # Both the attestation and the cosign signature are bound to this token.
+      id-token: write
+      # Writing to the repository's attestation store.
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: jars
+          path: dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.jar > SHA256SUMS
+          cat SHA256SUMS
+
+      # A signed SLSA provenance statement: which workflow, at which commit,
+      # on which runner, produced exactly these bytes. Independent of the GPG
+      # signature Maven Central requires, and rather stronger: a GPG
+      # signature proves someone held the key, this proves which workflow ran.
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.jar
+
+      # Syft reads the jar's own manifest and any embedded pom, so the SBOM
+      # describes what is inside the artifact rather than what the build file
+      # declares.
+      - name: Generate an SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/*.jar
+          sbom-path: dist/sbom.spdx.json
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless, unlike the GPG signature above: the certificate is issued to
+      # this workflow's OIDC identity, so there is nothing to manage and
+      # nothing to leak.
+      - name: Sign the jars
+        working-directory: dist
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          for f in *.jar SHA256SUMS; do
+            cosign sign-blob --bundle "${f}.sigstore" "$f"
+          done
+
+      - name: Attach to the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" ./* --clobber
+
+  # GitHub Packages instead of Maven Central. No GPG key, no portal token,
+  # no environment secrets — just the workflow's own token. Uncomment this and
+  # delete publish-central if the consumers are internal.
+  #
+  # publish-github-packages:
+  #   name: publish to GitHub Packages
+  #   needs: [release-please, build]
+  #   if: needs.release-please.outputs.release_created == 'true'
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         ref: ${{ needs.release-please.outputs.tag_name }}
+  #     - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+  #       with:
+  #         java-version: "21"
+  #         distribution: temurin
+  #         cache: maven
+  #         # setup-java knows this server id and writes the right settings.xml.
+  #         server-id: github
+  #     - name: Publish
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: ./mvnw --batch-mode --no-transfer-progress -DskipTests deploy

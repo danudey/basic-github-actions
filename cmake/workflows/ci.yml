@@ -1,0 +1,225 @@
+name: CI
+
+# Builds and tests on every compiler, operating system and architecture the
+# project claims to support, and then again under the sanitizers.
+#
+# C and C++ need a wider matrix than the other languages here, because the
+# compiler is part of the platform. Code that builds under GCC will fail under
+# Clang and again under MSVC, and each of the three finds bugs the others miss.
+# A single-compiler CI is the usual reason a project "does not build on
+# Windows".
+#
+# WHY THE SANITIZER JOB IS NOT OPTIONAL
+#   A C++ test suite that passes proves the tests did not crash. It does not
+#   prove there was no use-after-free, no read past the end of a buffer, no
+#   signed overflow, no data race — all of which are undefined behaviour that
+#   happens to have worked today, on this compiler, at this optimisation
+#   level. AddressSanitizer and UndefinedBehaviorSanitizer turn those into
+#   test failures. For a C or C++ project this is the single highest-value job
+#   in this file.
+#
+# WHAT TO CHANGE
+#   1. `SOURCE_DIR`, if CMakeLists.txt is not at the repository root.
+#   2. The `test` matrix. Add or remove compilers and runners. The runner
+#      determines which architecture: `ubuntu-24.04-arm` and `windows-11-arm`
+#      are the arm64 runners, and testing on one is how you find the code that
+#      assumed x86 alignment or a signed `char`.
+#   3. `CMAKE_ARGS`, for the project's own options. This is where
+#      `-DBUILD_TESTING=ON`, a preset, or a `-DCMAKE_TOOLCHAIN_FILE` for
+#      vcpkg goes.
+#   4. `CTEST_ARGS`. `--output-on-failure` is essential; without it a failing
+#      test tells you only its name.
+#
+# WHAT IT NEEDS
+#   - A CMakeLists.txt with `enable_testing()` and some `add_test()` calls,
+#     or ctest has nothing to run and the test step passes vacuously.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check per compiler, platform and build type, plus one per
+#     sanitizer.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_DIR: "."
+  # Extra arguments for the configure step. Add the project's own options,
+  # or -DCMAKE_TOOLCHAIN_FILE=... for vcpkg or Conan.
+  CMAKE_ARGS: ""
+  CTEST_ARGS: "--output-on-failure --timeout 300"
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux gcc (Release)
+            runner: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Release
+          - name: linux gcc (Debug)
+            runner: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+          - name: linux clang (Release)
+            runner: ubuntu-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+          # arm64 Linux. Different alignment rules, a signed `char` on some
+          # ABIs, and no x86 intrinsics: the row that catches portability
+          # assumptions nothing else will.
+          - name: linux arm64 gcc (Release)
+            runner: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+            build_type: Release
+          - name: macos clang (Release)
+            runner: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+          # MSVC, which is a genuinely different compiler with different
+          # warnings and a stricter template parser. `cc`/`cxx` are left
+          # unset so CMake picks the Visual Studio toolchain itself.
+          - name: windows msvc (Release)
+            runner: windows-latest
+            build_type: Release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Many C and C++ projects vendor dependencies as submodules. A
+          # checkout without them configures and then fails at the first
+          # `add_subdirectory`.
+          submodules: recursive
+
+      # A current CMake and Ninja on every runner. The version preinstalled on
+      # the GitHub images lags, and a `cmake_minimum_required` above it fails
+      # the configure step with a message that does not say so clearly.
+      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+
+      # Caches the compiler's object files across runs, keyed off the compiler
+      # and build type. On a large C++ project this is the difference between
+      # a twenty-minute build and a two-minute one, and it is the single
+      # biggest win available in a C++ CI.
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ${{ matrix.runner }}-${{ matrix.cc || 'msvc' }}-${{ matrix.build_type }}
+          # Enough for a mid-sized C++ project's object files.
+          max-size: 500M
+
+      - name: Configure
+        shell: bash
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          set -euo pipefail
+          # CMAKE_ARGS unquoted on purpose: it is a space-separated
+          # argument list, not a single argument.
+          # shellcheck disable=SC2086
+          cmake -S "${SOURCE_DIR}" -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_TESTING=ON \
+            ${CMAKE_ARGS}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test
+        shell: bash
+        run: |
+          # CTEST_ARGS unquoted on purpose: it is a space-separated argument
+          # list, not a single argument.
+          # shellcheck disable=SC2086
+          ctest --test-dir build --build-config ${{ matrix.build_type }} ${CTEST_ARGS}
+
+  # The job that finds the bugs a passing test suite hides. Each sanitizer
+  # instruments the binary differently and they cannot all be combined:
+  # AddressSanitizer and ThreadSanitizer are mutually exclusive, so they are
+  # separate rows.
+  sanitizers:
+    name: sanitizer (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Use-after-free, buffer overflow, leaks, and undefined behaviour
+          # such as signed overflow or a misaligned load. These two combine,
+          # and together they are the highest-value configuration.
+          - sanitizer: address,undefined
+          # Data races. Cannot be combined with AddressSanitizer, and only
+          # worth a row if the project actually uses threads.
+          - sanitizer: thread
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: sanitizer-${{ matrix.sanitizer }}
+          max-size: 500M
+
+      - name: Configure
+        shell: bash
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          set -euo pipefail
+          # -O1 rather than -O0: the sanitizers need some optimisation to
+          # produce usable stack traces, and -O0 makes the run much slower.
+          # -fno-omit-frame-pointer is what makes those traces readable.
+          flags="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -fno-sanitize-recover=all -g -O1"
+          # shellcheck disable=SC2086
+          cmake -S "${SOURCE_DIR}" -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="${flags}" \
+            -DCMAKE_CXX_FLAGS="${flags}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_TESTING=ON \
+            ${CMAKE_ARGS}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        shell: bash
+        env:
+          # Without halt_on_error the run reports the first problem and
+          # carries on with a corrupted heap, which produces a cascade of
+          # nonsense after the one finding that mattered.
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+        run: |
+          # shellcheck disable=SC2086
+          ctest --test-dir build ${CTEST_ARGS}

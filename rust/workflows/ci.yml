@@ -1,0 +1,193 @@
+name: CI
+
+# Builds and tests on every operating system and CPU architecture the project
+# claims to support.
+#
+# Two jobs, because they answer different questions:
+#
+#   test         does the code work. Runs the real test suite on real
+#                hardware, so it can only cover targets GitHub gives us
+#                runners for: x86-64 and arm64 on Linux, macOS and Windows.
+#
+#   cross-build  does the code still compile everywhere else. Catches the
+#                breakage that otherwise turns up mid-release: a `#[cfg]` that
+#                excludes every arm, a dependency with no support for the
+#                target, a `usize` assumed to be 64 bits.
+#
+# Clippy lives in codequality.yml and rustfmt in fmt.yml, so that a failing
+# lint and a failing test are different status checks and a formatting nit
+# does not read as "the build is broken".
+#
+# CROSS-COMPILING WITH ZIG
+#   `cargo zigbuild` uses Zig as the linker, which means one Linux runner can
+#   link for every musl and glibc target without installing a cross toolchain
+#   per architecture. It is the difference between a five-line matrix and a
+#   pile of apt-get lines. The alternative is `cross`, which uses Docker
+#   containers and handles cgo-heavy dependencies better but is slower.
+#
+# WHAT TO CHANGE
+#   1. `WORKING_DIRECTORY`, if Cargo.toml is not at the repository root. For a
+#      workspace, leave it at the workspace root and let `--workspace` do the
+#      walking.
+#   2. `TOOLCHAIN`. `stable` tracks the current release. Set it to an exact
+#      version ("1.85.0") if the project needs to be reproducible, and add a
+#      `rust-toolchain.toml` if developers should get the same one.
+#   3. The MSRV entry in the test matrix. It has to match `rust-version` in
+#      Cargo.toml; nothing checks that agreement for you, and an MSRV
+#      declared but not tested is the usual source of "it does not build on
+#      1.75".
+#   4. The `cross-build` matrix. `rustc --print target-list` prints every
+#      target rustc knows. Keep the ones you would answer a bug report for.
+#
+# WHAT IT NEEDS
+#   - A committed Cargo.lock. Every command uses `--locked`, so a stale lock
+#     fails rather than silently resolving something new.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check per runner and per target.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  TOOLCHAIN: "stable"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Debug info roughly triples target/ size and nothing in CI reads it.
+  # Halves the cache upload and download time on a large workspace.
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      # One platform failing should not hide the others.
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+        toolchain: ["stable"]
+        include:
+          # The minimum supported Rust version, on Linux only. This is the
+          # entry that catches use of a language or standard library feature
+          # newer than Cargo.toml's `rust-version` promises. Keep the value
+          # identical to that field, and delete the entry if the project does
+          # not commit to an MSRV.
+          - os: ubuntu-latest
+            toolchain: "1.85.0"
+          # Beta, so a change coming in six weeks is found now rather than on
+          # the day it ships. Allowed to fail: see the `continue-on-error`
+          # below.
+          - os: ubuntu-latest
+            toolchain: "beta"
+    # Beta breaking is upstream's news, not a reason to block a pull request.
+    continue-on-error: ${{ matrix.toolchain == 'beta' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          # Required, and there is no default: the action normally infers the
+          # toolchain from the ref it was called by (`@stable`), which a
+          # commit-SHA pin does not provide.
+          toolchain: ${{ matrix.toolchain }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # One cache per operating system and toolchain. Sharing a cache
+          # across toolchains means constant invalidation and no benefit.
+          key: ${{ matrix.toolchain }}
+          workspaces: ${{ env.WORKING_DIRECTORY }}
+
+      # --all-targets covers tests, benches and examples; example code that
+      # no longer compiles is the most commonly missed breakage in a Rust
+      # repository, because nothing else builds it.
+      - name: Test
+        run: cargo test --locked --all-features --all-targets --workspace
+
+      # A separate invocation because --all-targets excludes doc tests. Rust
+      # doc examples are compiled and run, so a doc test failure is a real
+      # failure of documented behaviour.
+      - name: Doc tests
+        run: cargo test --locked --all-features --doc --workspace
+
+      # Proves the crate builds with no optional features as well as with all
+      # of them. A feature-gated import that is used unconditionally compiles
+      # fine under --all-features and fails for the user who took the default.
+      - name: Build with no default features
+        run: cargo check --locked --no-default-features --workspace
+
+  # Compiles for every target the project supports but cannot run tests on.
+  # Deliberately not the release matrix: this is about finding the breakage
+  # early, not producing artifacts.
+  cross-build:
+    name: cross-build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # musl, so one Linux binary runs on any distribution.
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - riscv64gc-unknown-linux-musl
+          - s390x-unknown-linux-gnu
+          - powerpc64le-unknown-linux-gnu
+          # Uncomment for a no-std or embedded target. These need
+          # `cargo check` rather than a link step, and usually a
+          # `#![no_std]` crate to be meaningful:
+          # - thumbv7em-none-eabihf
+          # - wasm32-unknown-unknown
+          # - wasm32-wasip1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      # Zig as the cross-linker. One runner, every target, no per-arch
+      # toolchain to install.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          workspaces: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Build
+        run: cargo zigbuild --locked --release --all-features --workspace --target ${{ matrix.target }}

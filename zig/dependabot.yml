@@ -1,0 +1,51 @@
+version: 2
+
+# Dependabot has no Zig ecosystem. There is nothing to configure for
+# build.zig.zon, and nothing will open a pull request when a dependency there
+# gets a new release. This file therefore covers only the actions.
+#
+# WHAT TO DO ABOUT ZIG DEPENDENCIES INSTEAD
+#   1. `zig fetch --save <url>` rewrites the URL and the hash together, which
+#      is the only safe way to bump one by hand.
+#   2. audit.yml beside this file checks that every dependency is hashed and
+#      still fetchable, on a schedule. That catches the deleted tarball and
+#      the retagged release — the failures that break a fresh clone — but it
+#      cannot tell you a newer version exists.
+#   3. If the project vendors C source, the `docker` and `github-actions`
+#      ecosystems will not help and there is no manifest for Dependabot to
+#      read. audit.yml's Trivy filesystem scan is the substitute: it
+#      identifies bundled library versions from their own headers.
+#   4. Renovate does support Zig, via a `regexManagers` rule over
+#      build.zig.zon. If keeping Zig dependencies current matters to the
+#      project, that is the tool to reach for rather than this file.
+
+updates:
+  # The actions in .github/workflows. They are pinned to commit SHAs, which
+  # nothing updates on its own and which no human will notice has gone stale.
+  # Dependabot rewrites both the SHA and the version comment beside it.
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # Dependabot's own default subject ("Bump x from a to b") is not a
+    # conventional commit, so without this every update opens a pull request
+    # that immediately fails pr-title.yml.
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+    open-pull-requests-limit: 10

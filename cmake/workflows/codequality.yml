@@ -1,0 +1,235 @@
+name: codequality
+
+# Static analysis, reported as code scanning alerts rather than as a wall of
+# text in a log.
+#
+# Three tools, and it is worth knowing which one to trust for what:
+#
+#   CodeQL      the strongest of the three for security defects, and it needs
+#               no conversion step because it writes SARIF natively. It is
+#               configured in universal/workflows/codeql.yml with
+#               `language: c-cpp` — enable it there rather than duplicating
+#               it here, and treat that as the primary scanner.
+#
+#   clang-tidy  the one that finds day-to-day defects: a member left
+#               uninitialised, a `virtual` destructor missing, a loop
+#               copying by value, a smart pointer used where a reference
+#               would do. Needs a compile_commands.json, which is why the
+#               job configures the project before linting it.
+#
+#   cppcheck    a second opinion with a different engine. It catches some
+#               things clang-tidy does not, notably in plain C, and it runs
+#               without a compilation database.
+#
+# WHAT TO CHANGE
+#   1. `SOURCE_DIR`, if CMakeLists.txt is not at the repository root.
+#   2. `.clang-tidy` in the repository. This is where the value is; without
+#      one you get clang-tidy's defaults, which are close to nothing. A
+#      reasonable starting point is in the README beside this file.
+#   3. `LINT_PATHS`: which directories to lint. Point it at your own source
+#      only — running clang-tidy over vendored third-party headers produces
+#      thousands of findings you cannot fix.
+#   4. `CMAKE_ARGS`, so the configure step matches ci.yml. clang-tidy sees the
+#      code as the compiler was told to see it, so a missing `-D` here means
+#      it lints a different program.
+#
+# WHAT IT NEEDS
+#   - A public repository, or GitHub Advanced Security on a private one, for
+#     the SARIF uploads.
+#   - A `.clang-tidy` for the clang-tidy job to be worth much.
+#
+# WHAT IT PRODUCES
+#   - Alerts under Security -> Code scanning, in two categories:
+#     `clang-tidy` and `cppcheck`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Both tools gain checks without this repository changing.
+    - cron: "31 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codequality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_DIR: "."
+  CMAKE_ARGS: ""
+  # Space-separated directories holding your own source. Do not point this at
+  # the repository root if third-party code is vendored in it.
+  LINT_PATHS: "src include"
+
+jobs:
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Writing the SARIF results as code scanning alerts.
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+
+      # clang-tidy needs to know how each file is compiled — the include
+      # paths, the defines, the standard. CMAKE_EXPORT_COMPILE_COMMANDS
+      # writes that out as compile_commands.json. Without it, clang-tidy
+      # guesses, and every finding is about a header it could not locate.
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          # CMAKE_ARGS unquoted on purpose: it is a space-separated
+          # argument list, not a single argument.
+          # shellcheck disable=SC2086
+          cmake -S "${SOURCE_DIR}" -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_TESTING=ON \
+            ${CMAKE_ARGS}
+
+      # Generated headers have to exist before clang-tidy reads the files that
+      # include them. `--target all` is heavier than necessary but reliable;
+      # narrow it to the generator targets if the build is slow.
+      - name: Generate headers
+        run: cmake --build build --parallel --target all
+
+      # cargo-binstall to fetch clang-tidy-sarif, which converts clang-tidy's
+      # YAML output into SARIF. Rust is preinstalled on the GitHub Ubuntu
+      # images, so this needs no toolchain step, and binstall pulls a prebuilt
+      # binary rather than compiling it.
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-binstall
+
+      - name: Install the SARIF converter
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo binstall --no-confirm --locked clang-tidy-sarif sarif-fmt
+
+      - name: Run clang-tidy
+        id: lint
+        # The upload below has to happen even when the lint fails, otherwise
+        # the findings that caused the failure never reach the security tab.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          # run-clang-tidy parallelises across the compilation database and is
+          # shipped with clang-tidy itself. `-quiet` suppresses the per-file
+          # banner, which otherwise buries the findings.
+          # LINT_PATHS unquoted on purpose: it is a space-separated list
+          # of directories.
+          # shellcheck disable=SC2086
+          run-clang-tidy -p build -quiet ${LINT_PATHS} \
+            | clang-tidy-sarif > clang-tidy.sarif
+          # Render the same findings into the log so the run is not silent,
+          # and take the exit status from the renderer.
+          sarif-fmt < clang-tidy.sarif
+          # A non-empty results array means findings.
+          test "$(python3 -c 'import json,sys; print(sum(len(r["results"]) for r in json.load(open("clang-tidy.sarif"))["runs"]))')" = "0"
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: clang-tidy.sarif
+          category: clang-tidy
+          wait-for-processing: true
+
+      - name: Fail if clang-tidy found anything
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "clang-tidy reported findings; see the Code scanning tab." >&2
+          exit 1
+
+  cppcheck:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      # Built from the release tarball rather than taken from apt, because the
+      # Ubuntu package lags and SARIF output is a recent addition. Compiling
+      # cppcheck takes about a minute.
+      - name: Install cppcheck
+        env:
+          CPPCHECK_VERSION: "2.19.0"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libpcre3-dev
+          curl -fsSL "https://github.com/danmar/cppcheck/archive/refs/tags/${CPPCHECK_VERSION}.tar.gz" \
+            -o cppcheck.tar.gz
+          mkdir cppcheck-src
+          tar xzf cppcheck.tar.gz -C cppcheck-src --strip-components=1
+          cmake -S cppcheck-src -B cppcheck-build \
+            -DCMAKE_BUILD_TYPE=Release -DHAVE_RULES=ON -DUSE_MATCHCOMPILER=ON
+          cmake --build cppcheck-build --parallel
+          sudo cmake --install cppcheck-build
+          cppcheck --version
+
+      - name: Run cppcheck
+        id: lint
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --enable=all turns on the style, performance and portability
+          # checks as well as errors. --inline-suppr honours
+          # `// cppcheck-suppress` comments, which is how a deliberate
+          # exception is recorded next to the code rather than in a config
+          # file nobody reads.
+          #
+          # missingInclude and unusedFunction are suppressed because both are
+          # unreliable without the full build: the first fires on every
+          # system header, the second on every exported symbol in a library.
+          # shellcheck disable=SC2086
+          cppcheck \
+            --enable=all \
+            --inline-suppr \
+            --suppress=missingInclude \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --suppress=checkersReport \
+            --std=c++20 \
+            --output-format=sarif \
+            --error-exitcode=1 \
+            ${LINT_PATHS} 2> cppcheck.sarif
+        env:
+          LINT_PATHS: ${{ env.LINT_PATHS }}
+
+      - name: Upload to code scanning
+        # cppcheck writes SARIF to stderr, so an empty file means it did not
+        # run rather than that it found nothing. Guard the upload.
+        if: hashFiles('cppcheck.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: cppcheck.sarif
+          category: cppcheck
+          wait-for-processing: true
+
+      - name: Fail if cppcheck found anything
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "cppcheck reported findings; see the Code scanning tab." >&2
+          cat cppcheck.sarif || true
+          exit 1

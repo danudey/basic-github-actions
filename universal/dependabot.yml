@@ -1,0 +1,63 @@
+version: 2
+
+# The language-agnostic half of a dependabot.yml: keeping the actions in
+# .github/workflows current.
+#
+# Every workflow in this library pins its actions to a full commit SHA. That
+# is the only reference GitHub will not let an upstream maintainer silently
+# repoint, so it is the only one worth trusting — but nothing updates a SHA on
+# its own, and no human is going to notice one has gone stale. Dependabot
+# rewrites both the SHA and the `# vX.Y.Z` comment beside it, which is what
+# keeps the pin honest instead of merely old.
+#
+# WHAT TO CHANGE
+#   - Nothing, if this repository has no package manager of its own.
+#   - Otherwise: copy the second `updates:` entry from the matching language
+#     directory in this library (go/dependabot.yml, python/dependabot.yml, and
+#     so on) and append it below. A repository has exactly one
+#     .github/dependabot.yml, so a polyglot repository needs one entry per
+#     ecosystem in the one file, not one file per ecosystem.
+#   - The `prefix` under commit-message. It has to be a type that
+#     pr-title.yml accepts, or every Dependabot pull request fails its own
+#     title check. `ci` for the actions, because they are not shipped.
+#
+# WHAT IT NEEDS
+#   - To live at .github/dependabot.yml. Nowhere else is read.
+#   - Nothing else. Dependabot needs no secrets for public registries.
+#
+# WHAT IT PRODUCES
+#   - One grouped pull request a week bumping every action that has moved.
+
+updates:
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    # It also covers .github/actions and any composite actions there.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # Dependabot's own default subject ("Bump x from a to b") is not a
+    # conventional commit, so without this every update opens a pull request
+    # that immediately fails pr-title.yml. This makes them read
+    # "ci(deps): bump ...".
+    commit-message:
+      prefix: ci
+      include: scope
+    # One pull request for all of them rather than one each. Actions bump
+    # often and independently; separate pull requests are pure noise.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+    # Raise this if a grouped run is being held back. Ten is plenty for one
+    # grouped pull request plus the occasional ungroupable major bump.
+    open-pull-requests-limit: 10

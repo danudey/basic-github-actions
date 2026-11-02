@@ -1,0 +1,184 @@
+name: audit
+
+# Asks whether anything the project depends on is known to be vulnerable
+# today. Advisories are published without this repository changing, so this
+# runs on a schedule as well as on pull requests.
+#
+# C and C++ dependency auditing is harder than in the other languages here,
+# for one structural reason: there is often no manifest. A project may vendor
+# zlib as a git submodule, or copy a header-only library into third_party/, or
+# link whatever the system provides. None of that is a dependency list a tool
+# can read, which is why this workflow uses three different approaches rather
+# than one:
+#
+#   osv-scanner   reads a real manifest where one exists: vcpkg.json,
+#                 conan.lock, or a CMake FetchContent list it can resolve.
+#                 Precise, and only useful if the project has one.
+#
+#   trivy fs      identifies bundled library versions from their own headers
+#                 and version files, so it finds a vendored zlib even with no
+#                 manifest at all. This is the one that works on a typical
+#                 C++ repository.
+#
+#   submodules    reports how far behind each git submodule is. Not a
+#                 vulnerability check, but a submodule pinned to a commit
+#                 from 2019 is where the vulnerabilities are, and nothing
+#                 else in this file will say so.
+#
+# WHAT TO CHANGE
+#   1. `SOURCE_DIR`, if CMakeLists.txt is not at the repository root.
+#   2. `.trivyignore`, for findings that are known and unfixable here. Put the
+#      reason and a review date beside each one; an unexplained ignore entry
+#      outlives the problem it was added for.
+#   3. The cron. Weekly is a reasonable default.
+#   4. Delete the `submodules` job if the project has none.
+#
+# WHAT IT NEEDS
+#   - A public repository, or GitHub Advanced Security, for the SARIF uploads.
+#   - No secrets.
+#
+# WHAT IT PRODUCES
+#   - Alerts under Security -> Code scanning, in the `osv-scanner` and
+#     `trivy-fs` categories.
+#   - A submodule staleness report in the job summary.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Monday morning, off the top of the hour, which GitHub asks for.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_DIR: "."
+
+jobs:
+  osv-scanner:
+    name: osv-scanner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      # Finds vcpkg.json, conan.lock and a handful of other C/C++ manifests
+      # on its own. Silent if the project has none, which is the common case
+      # and the reason the trivy job below exists.
+      - name: Scan the manifests
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv-scanner.sarif
+            ./
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: osv-scanner.sarif
+          category: osv-scanner
+
+  trivy:
+    name: trivy (filesystem)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The submodules are the point of this job: a vendored copy of a
+          # library is exactly what it is looking for.
+          submodules: recursive
+
+      # Identifies bundled libraries by fingerprinting their own source —
+      # zlib.h's ZLIB_VERSION, sqlite3.h's SQLITE_VERSION, and so on — so it
+      # works on a repository with no manifest whatsoever. It also scans for
+      # committed secrets, which turn up in C++ repositories about as often as
+      # anywhere else.
+      - name: Scan the tree
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          scanners: vuln,secret
+          skip-dirs: "build,out,.cache"
+        env:
+          # The action pulls its databases from a container registry, which is
+          # rate-limited for anonymous pulls. These mirror them through
+          # GitHub's registry instead.
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # Not a vulnerability check. It answers the question that precedes one: how
+  # old is each vendored dependency. Nothing else in this file will tell you
+  # that a submodule has been pinned to a 2019 commit for six years.
+  submodules:
+    name: submodule staleness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+          # Full history in each submodule, so the commit distance below is
+          # computable.
+          fetch-depth: 0
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          if [ ! -f .gitmodules ]; then
+            echo "no submodules" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Submodules"
+            echo
+            echo "| path | pinned commit | date | behind |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Single-quoted on purpose: git substitutes $sm_path itself, and
+          # the rest must be evaluated inside each submodule, not here.
+          # shellcheck disable=SC2016
+          git submodule foreach --quiet '
+            sha=$(git rev-parse --short HEAD)
+            date=$(git log -1 --format=%cs HEAD)
+            git fetch --quiet origin 2>/dev/null || true
+            # The default branch as origin sees it, falling back to main.
+            upstream=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)
+            behind=$(git rev-list --count "HEAD..${upstream}" 2>/dev/null || echo "?")
+            echo "| $sm_path | $sha | $date | $behind commits |"
+          ' >> "$GITHUB_STEP_SUMMARY"
+
+          cat "$GITHUB_STEP_SUMMARY"

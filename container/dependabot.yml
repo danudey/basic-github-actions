@@ -1,0 +1,91 @@
+version: 2
+
+# A repository has exactly one .github/dependabot.yml, so this file is the
+# whole thing: the github-actions entry plus the Docker one. A repository that
+# builds an image also has an application inside it, so append the entry from
+# the matching language directory in this library too.
+
+updates:
+  # The actions in .github/workflows. They are pinned to commit SHAs, which
+  # nothing updates on its own and which no human will notice has gone stale.
+  # Dependabot rewrites both the SHA and the version comment beside it.
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  # Base images in FROM lines. `directory` is where the Dockerfile lives, not
+  # the build context.
+  #
+  # This is the single most valuable Dependabot entry for a container
+  # repository. Most of an image's CVEs come from its base layer, and a base
+  # image tag does not change under you — `FROM debian:12.5-slim` stays on
+  # 12.5 forever, quietly accumulating advisories, until somebody edits the
+  # line. This is what edits the line.
+  #
+  # It requires the tag to be a version Dependabot can compare. `FROM
+  # alpine:latest` or `FROM debian:stable-slim` give it nothing to work with,
+  # and it will silently do nothing. Pin a real version, ideally with a digest:
+  #   FROM alpine:3.21@sha256:...
+  # Dependabot updates both the tag and the digest together.
+  - package-ecosystem: docker
+    directory: /
+    # Several Dockerfiles in different directories need one entry each, or a
+    # `directories:` list:
+    # directories:
+    #   - /
+    #   - /build
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      # More often than the rest. A base image update is usually a security
+      # fix, and waiting a week for it is the wrong trade.
+      interval: daily
+      time: "06:00"
+      timezone: Etc/UTC
+    # "fix" rather than "build": a base image bump generally does carry a
+    # security fix through to users, so it should cut a patch release and
+    # appear in the changelog.
+    commit-message:
+      prefix: fix
+      include: scope
+    groups:
+      docker:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - docker
+    open-pull-requests-limit: 5
+    # Dependabot will offer a major base image bump — debian:12 to debian:13 —
+    # as readily as a patch. That is a distribution upgrade, not a dependency
+    # update, and it belongs in a deliberate pull request. Uncomment to hold
+    # them back:
+    #
+    # ignore:
+    #   - dependency-name: "debian"
+    #     update-types: ["version-update:semver-major"]
+
+  # Also worth having: the base images used inside the workflows themselves,
+  # if any job uses `container:` or a service container. Dependabot's
+  # github-actions ecosystem covers those, so the first entry already does it.

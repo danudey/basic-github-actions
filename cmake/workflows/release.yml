@@ -1,0 +1,315 @@
+name: Release
+
+# Cuts a release and publishes signed, attested binaries for every platform
+# the project supports.
+#
+# The shape is: release-please holds a release pull request open against main,
+# accumulating the changelog from conventional commit subjects. Merging that
+# pull request tags the release, and the tag is what unblocks the build jobs.
+# Nothing here runs on an ordinary merge.
+#
+# WHY THIS MATRIX IS RUNNER-SHAPED RATHER THAN TARGET-SHAPED
+#   Unlike Go, Rust or Zig, C and C++ have no free cross-compilation. Building
+#   for macOS needs a macOS runner, for MSVC a Windows one, and for a
+#   different Linux architecture either a native runner or a cross toolchain
+#   installed by hand. So this matrix is one row per runner, and the set of
+#   platforms you can ship is the set of runners you are willing to use.
+#
+#   The Linux rows build inside a container image old enough that the
+#   resulting binary runs on a current distribution as well as on one from
+#   several years ago. A binary linked against the runner's own glibc will
+#   refuse to start on anything older, which is the most common complaint
+#   about a hand-rolled C++ release.
+#
+# WHAT EACH ARTIFACT COMES WITH
+#   archive.tar.gz            the binary, README and LICENSE
+#   archive.tar.gz.sha256     the checksum, for a quick manual check
+#   archive.tar.gz.sigstore   a Sigstore bundle: signature, certificate and
+#                             inclusion proof in one file
+#   archive.spdx.json         an SBOM of what went into the binary
+#   SHA256SUMS(.sigstore)     every checksum in one signed file
+#   plus, in GitHub's attestation store, a signed SLSA provenance statement
+#   and a signed SBOM attestation for each archive
+#
+# None of that needs a key. Both the provenance and the cosign signature use
+# the workflow's OIDC identity, so what a verifier checks is "this artifact
+# was built by this workflow, in this repository, from this commit".
+#
+# HOW A USER VERIFIES IT
+#   gh attestation verify ./tool-v1.2.3-linux-x86_64.tar.gz --repo OWNER/REPO
+#
+#   cosign verify-blob \
+#     --bundle tool-v1.2.3-linux-x86_64.tar.gz.sigstore \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --certificate-identity-regexp '^https://github.com/OWNER/REPO/' \
+#     ./tool-v1.2.3-linux-x86_64.tar.gz
+#
+# WHAT TO CHANGE
+#   1. `BINARY_NAME` below. It is the target name from `add_executable` and
+#      the stem of every archive.
+#   2. `SOURCE_DIR`, if CMakeLists.txt is not at the repository root.
+#   3. `CMAKE_ARGS`. Keep it consistent with ci.yml, or you ship a
+#      differently configured program from the one that was tested.
+#   4. The build matrix. Each row is one archive on the release.
+#   5. `EXTRA_FILES`, for anything else that belongs in the archive.
+#
+# WHAT IT NEEDS
+#   - release-please-config.json and .release-please-manifest.json at the
+#     repository root. See universal/ in this library for both.
+#   - Squash merging with the pull request title as the commit subject:
+#       Settings -> General -> Pull Requests -> Default commit message
+#   - `install(TARGETS ...)` in CMakeLists.txt. This workflow packages what
+#     `cmake --install` puts in the staging directory; a project with no
+#     install rules produces an empty archive.
+#   - A public repository, or GitHub Advanced Security, for the attestation
+#     steps.
+#   - No secrets.
+#
+# WHAT IT PRODUCES
+#   - A GitHub release, tagged, with the artifacts above attached.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_DIR: "."
+  # The add_executable target name, and the stem of every archive.
+  BINARY_NAME: "tool"
+  CMAKE_ARGS: ""
+  # Files copied into every archive alongside the install tree.
+  EXTRA_FILES: "README.md LICENSE"
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ${{ matrix.runner }}
+    # An old container on the Linux rows, so the binary's glibc requirement is
+    # low enough to run on distributions that are not this month's. Empty
+    # elsewhere: `container:` is Linux-only.
+    container: ${{ matrix.container }}
+    permissions:
+      # Uploading the artifacts to the release.
+      contents: write
+      # The OIDC token the attestation and the signature are bound to.
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # manylinux_2_28 is a RHEL/AlmaLinux 8 image with a modern GCC
+          # backported. Linking against its glibc 2.28 means the binary runs
+          # on anything from about 2019 onwards, rather than only on this
+          # year's Ubuntu.
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:7e41b1c7fd64dfc69703a1124b43c404382973ee06ec5d764b85c34d2221fded
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64@sha256:54b271d9562a3686298880df05367909e949ed317e7b1b79b59c696d75f78676
+          - name: macos-arm64
+            runner: macos-latest
+            container: ""
+          - name: macos-x86_64
+            runner: macos-15-intel
+            container: ""
+          - name: windows-x86_64
+            runner: windows-latest
+            container: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          submodules: recursive
+
+      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+
+      - name: Configure
+        shell: bash
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          # CMAKE_INSTALL_PREFIX points at a staging directory rather than the
+          # system, so `cmake --install` collects exactly what should ship.
+          #
+          # On macOS, CMAKE_OSX_DEPLOYMENT_TARGET is what stops the binary
+          # requiring the runner's own macOS version; 11.0 covers every
+          # machine Apple still supports.
+          extra=""
+          case "${{ matrix.name }}" in
+            macos-*) extra="-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0" ;;
+          esac
+
+          # Both unquoted on purpose: each is a space-separated argument list,
+          # not a single argument.
+          # shellcheck disable=SC2086
+          cmake -S "${SOURCE_DIR}" -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/staging/install" \
+            -DBUILD_TESTING=OFF \
+            ${extra} \
+            ${CMAKE_ARGS}
+
+      - name: Build and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release --strip
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          name="${BINARY_NAME}-${TAG}-${PLATFORM}"
+          mkdir -p "staging/${name}"
+
+          # Everything the install rules produced.
+          cp -R staging/install/. "staging/${name}/"
+          # Unquoted on purpose: EXTRA_FILES is a space-separated list.
+          # shellcheck disable=SC2086
+          [ -n "${EXTRA_FILES}" ] && cp ${EXTRA_FILES} "staging/${name}/"
+
+          if [ ! "$(ls -A "staging/${name}")" ]; then
+            echo "::error::The install tree is empty. Does CMakeLists.txt have install(TARGETS ...) rules?"
+            exit 1
+          fi
+
+          cd staging
+          if [[ "$PLATFORM" == windows-* ]]; then
+            archive="${name}.zip"
+            7z a -tzip "$archive" "$name" >/dev/null
+          else
+            archive="${name}.tar.gz"
+            tar czf "$archive" "$name"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+
+          {
+            echo "name=${name}"
+            echo "archive=${archive}"
+            echo "dir=staging"
+          } >> "$GITHUB_OUTPUT"
+
+      # A signed SLSA provenance statement: which workflow, at which commit,
+      # on which runner, produced exactly these bytes. Stored by GitHub
+      # against the repository and checked with `gh attestation verify`.
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.archive }}
+
+      # Syft has no C++ manifest to read on most projects, so it fingerprints
+      # the binary and the source tree instead. The result is thinner than a
+      # Go or Cargo SBOM — that is a fact about C++ packaging, not about this
+      # step — but it does pick up vendored libraries and vcpkg manifests.
+      - name: Generate an SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.name }}
+          format: spdx-json
+          output-file: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.archive }}
+          sbom-path: ${{ steps.package.outputs.dir }}/${{ steps.package.outputs.name }}.spdx.json
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Belt and braces alongside the attestation above. The attestation lives
+      # in GitHub's store and needs `gh` to check; this bundle sits next to
+      # the artifact and can be checked by anyone with cosign and no GitHub
+      # account. Keyless, so there is no key to manage.
+      - name: Sign the archive
+        shell: bash
+        working-directory: ${{ steps.package.outputs.dir }}
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          COSIGN_YES: "true"
+        run: cosign sign-blob --bundle "${ARCHIVE}.sigstore" "$ARCHIVE"
+
+      - name: Upload to the release
+        shell: bash
+        working-directory: ${{ steps.package.outputs.dir }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          gh release upload "$TAG" \
+            "$ARCHIVE" \
+            "${ARCHIVE}.sha256" \
+            "${ARCHIVE}.sigstore" \
+            "${NAME}.spdx.json" \
+            --clobber
+
+  # One SHA256SUMS covering every platform, so a user or a package manager can
+  # fetch a single file and check whichever archive they downloaded. Signed
+  # too, because an unsigned checksum file is only as trustworthy as the
+  # connection that fetched it.
+  checksums:
+    name: checksums
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Combine and sign the checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          mkdir sums && cd sums
+          gh release download "$TAG" --pattern '*.sha256' --dir .
+          # sorted, so the file is stable between runs regardless of the order
+          # the matrix jobs happened to finish in.
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          cosign sign-blob --bundle SHA256SUMS.sigstore SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS SHA256SUMS.sigstore --clobber

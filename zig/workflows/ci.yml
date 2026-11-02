@@ -1,0 +1,170 @@
+name: CI
+
+# Builds and tests on every operating system and target the project claims to
+# support.
+#
+# Zig is the easiest language here to cross-compile: the compiler ships every
+# target's libc and linker, so one Linux runner can produce a working binary
+# for macOS arm64 or Windows x86-64 with no toolchain to install. The
+# cross-build matrix below is therefore large and cheap.
+#
+# A NOTE ON ZIG VERSIONS
+#   Zig is pre-1.0 and the language and standard library still change between
+#   releases. `ZIG_VERSION` is pinned to an exact release rather than
+#   `master`, because a floating version turns a green main branch red with no
+#   commit behind it — and the failure is usually a renamed standard library
+#   function, not a defect in this code. The `master` row in the matrix exists
+#   to see that coming, and is allowed to fail.
+#
+# WHAT TO CHANGE
+#   1. `ZIG_VERSION`. Keep it equal to the `minimum_zig_version` in
+#      build.zig.zon if the project declares one.
+#   2. `WORKING_DIRECTORY`, if build.zig is not at the repository root.
+#   3. The `cross-build` matrix. `zig targets` prints every target the
+#      compiler knows; the list is long. Keep the ones you would answer a bug
+#      report for.
+#   4. The optimisation modes in the `optimize` job. Zig's safety checks are
+#      compiled out in ReleaseFast and ReleaseSmall, so a bug that Debug and
+#      ReleaseSafe catch — an integer overflow, an out-of-bounds slice — is
+#      undefined behaviour in the mode you ship. Testing all four is how you
+#      find out which.
+#
+# WHAT IT NEEDS
+#   - build.zig, and a `test` step in it. `zig build test` is the convention.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check per runner, per target and per optimisation mode.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, zig ${{ matrix.zig }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+        zig: ["0.15.2"]
+        include:
+          # Zig's own development branch. This is the row that gives warning
+          # of a breaking standard library change, weeks before the release
+          # that carries it. Allowed to fail: upstream breaking is upstream's
+          # news, not a reason to block a pull request.
+          - os: ubuntu-latest
+            zig: "master"
+    continue-on-error: ${{ matrix.zig == 'master' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ matrix.zig }}
+          # Caches the global Zig cache directory, which holds the compiled
+          # standard library and every fetched dependency. Without it every
+          # run recompiles the lot.
+          use-cache: true
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Test
+        run: zig build test --summary all
+
+  # Zig's safety checks — bounds, overflow, null unwrap — are present in Debug
+  # and ReleaseSafe and compiled out in ReleaseFast and ReleaseSmall. A bug
+  # the first two catch as a panic is undefined behaviour in the last two, so
+  # testing only Debug tells you nothing about what you ship.
+  optimize:
+    name: build (${{ matrix.optimize }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast, ReleaseSmall]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: true
+
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: Test
+        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+
+  # Compiles for every target the project supports but cannot run tests on.
+  # Cheap in Zig, because the compiler carries every target's libc, so this
+  # matrix can be much wider than it would be in another language.
+  cross-build:
+    name: cross-build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - arm-linux-musleabihf
+          - riscv64-linux-musl
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-macos
+          - aarch64-macos
+          - x86_64-windows-gnu
+          - aarch64-windows-gnu
+          # Uncomment for freestanding and WebAssembly targets. These usually
+          # need the build to be conditional on the target, so they will fail
+          # until build.zig accounts for them:
+          # - wasm32-wasi
+          # - wasm32-freestanding
+          # - thumb-freestanding-eabihf
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: true
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --summary all

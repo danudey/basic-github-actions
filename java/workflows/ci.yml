@@ -1,0 +1,191 @@
+name: CI
+
+# Builds and tests on every JDK and operating system the project claims to
+# support.
+#
+# All the Java workflows in this directory share one knob, BUILD_TOOL, and
+# work with Maven or Gradle. The pattern is a `case` over the tool that writes
+# a `$BUILD` command into the environment; every later step uses
+# `$BUILD verify` rather than hard-coding `mvn` or `./gradlew`.
+#
+# A NOTE ON ARCHITECTURES
+#   The JVM abstracts the CPU away, so for pure Java the operating system
+#   matrix below is mostly about the filesystem: path separators, case
+#   sensitivity, line endings, file locking on Windows. Those are real and do
+#   break tests. Where the architecture genuinely matters is a project with
+#   JNI or a native dependency, and for that the `ubuntu-24.04-arm` row is
+#   the one that earns its place.
+#
+# WHAT TO CHANGE
+#   1. `BUILD_TOOL`: maven or gradle.
+#   2. `WORKING_DIRECTORY`, if pom.xml or build.gradle is not at the
+#      repository root.
+#   3. The `java` matrix. Every version the project supports. It should agree
+#      with `maven.compiler.release` or Gradle's `sourceCompatibility`;
+#      nothing checks that agreement for you, and a version claimed but not
+#      tested is the usual source of "it does not run on 17".
+#   4. `DISTRIBUTION`. `temurin` is the usual choice. `graalvm` if the project
+#      builds a native image; `zulu` and `corretto` are also available.
+#
+# WHAT IT NEEDS
+#   - A Maven wrapper (`mvnw`) or Gradle wrapper (`gradlew`) committed, ideally.
+#     Without one the build uses whatever version the runner ships, which
+#     changes under you. The steps below use the wrapper when it exists.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check per JDK and operating system.
+#   - Test reports as artifacts, which is the only way to read a failure that
+#     happened inside a forked JVM.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # maven | gradle
+  BUILD_TOOL: "maven"
+  WORKING_DIRECTORY: "."
+  DISTRIBUTION: "temurin"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, java ${{ matrix.java }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash on Windows too, so one `case` statement covers every runner.
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+        # The LTS releases. Add a non-LTS only if you intend to support it.
+        java: ["17", "21", "25"]
+        # The full matrix on Linux; only the newest and oldest elsewhere,
+        # because what the other platforms test is the filesystem rather than
+        # the JDK. Delete this to test everything everywhere.
+        exclude:
+          - { os: macos-latest, java: "21" }
+          - { os: windows-latest, java: "21" }
+          - { os: ubuntu-24.04-arm, java: "17" }
+          - { os: ubuntu-24.04-arm, java: "21" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: ${{ env.DISTRIBUTION }}
+          # Caches ~/.m2 or ~/.gradle keyed off the build files. On a
+          # dependency-heavy project this is the difference between a
+          # three-minute build and a thirty-second one.
+          cache: ${{ env.BUILD_TOOL }}
+
+      # Gradle's own action, which caches the configuration cache and the
+      # build cache as well as the dependency cache, and writes a build scan
+      # link into the job summary. Worth having over setup-java's cache alone.
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          # Fails the build if gradle-wrapper.jar does not match a known
+          # release. That jar is executable code committed to the repository,
+          # and a tampered one runs with the build's full privileges.
+          validate-wrappers: true
+
+      # One place that knows how each tool is invoked. $BUILD is exported to
+      # every later step through $GITHUB_ENV.
+      - name: Resolve the build command
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              # The wrapper if it is committed, the runner's mvn otherwise.
+              # --batch-mode suppresses the download progress spinner, which
+              # otherwise produces thousands of log lines.
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              echo "BUILD=${cmd} --batch-mode --no-transfer-progress" >> "$GITHUB_ENV"
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              echo "BUILD=${cmd} --no-daemon --stacktrace" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::BUILD_TOOL must be maven or gradle" >&2
+              exit 1
+              ;;
+          esac
+
+      # `verify` in Maven and `build` in Gradle both compile, test and run the
+      # packaging checks. Deliberately not `test`, which skips the integration
+      # tests and the packaging.
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)  $BUILD verify ;;
+            gradle) $BUILD build ;;
+          esac
+
+      # A test that fails inside a forked JVM prints nothing useful to the
+      # console; the surefire or Gradle XML report is the only record of what
+      # actually happened. `if: always()` because the reports matter most on
+      # the run that failed.
+      - name: Keep the test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports-${{ matrix.os }}-java${{ matrix.java }}
+          path: |
+            ${{ env.WORKING_DIRECTORY }}/**/target/surefire-reports/**
+            ${{ env.WORKING_DIRECTORY }}/**/target/failsafe-reports/**
+            ${{ env.WORKING_DIRECTORY }}/**/build/reports/tests/**
+            ${{ env.WORKING_DIRECTORY }}/**/build/test-results/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Reproducibility of the built jar. A jar embeds timestamps and file order
+  # by default, so two builds of the same commit produce different bytes,
+  # which makes the release attestations much weaker than they look: a
+  # verifier can check who built it but not that the source matches. Maven's
+  # `artifact:check-buildplan` reports whether the project is configured to
+  # avoid that.
+  #
+  # Delete this job if the project is not aiming at reproducible builds — but
+  # read it first, because the fix is usually two properties in the pom.
+  reproducible:
+    name: reproducible build check
+    if: false # set to `true` once the project is configured for it
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: "21"
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: maven
+
+      - name: Check the build plan
+        run: ./mvnw --batch-mode --no-transfer-progress artifact:check-buildplan

@@ -1,0 +1,230 @@
+name: codequality
+
+# Static analysis, reported as code scanning alerts rather than as a wall of
+# text in a log.
+#
+# Java is the one language here where the strongest scanner needs no
+# conversion step and no plugin: CodeQL analyses Java and Kotlin natively and
+# writes SARIF itself. Enable `language: java-kotlin` in
+# universal/workflows/codeql.yml and treat that as the primary scanner.
+#
+# What this workflow adds on top:
+#
+#   SpotBugs   bytecode analysis, which finds a different class of defect
+#              from a source-level scanner: a null dereference on a path the
+#              source does not make obvious, an `equals` without `hashCode`,
+#              a stream never closed, an `Integer` compared with `==`. With
+#              the FindSecBugs plugin it also covers injection and crypto
+#              misuse. Emits SARIF directly, but only when the build file is
+#              configured to ask for it — see WHAT IT NEEDS below.
+#
+#   PMD        source-level rules about complexity and dead code. Cheap, and
+#              the findings are usually easy to act on.
+#
+# WHAT TO CHANGE
+#   1. `BUILD_TOOL`: maven or gradle.
+#   2. `WORKING_DIRECTORY`, if the build file is not at the repository root.
+#   3. The plugin configuration in pom.xml or build.gradle. That is where the
+#      real work is; this workflow only invokes it. The README beside this
+#      file has the snippets for both tools.
+#
+# WHAT IT NEEDS
+#   For Maven, in pom.xml:
+#     <plugin>
+#       <groupId>com.github.spotbugs</groupId>
+#       <artifactId>spotbugs-maven-plugin</artifactId>
+#       <configuration>
+#         <sarifOutput>true</sarifOutput>
+#         <includeTests>true</includeTests>
+#         <plugins>
+#           <plugin>
+#             <groupId>com.h3xstream.findsecbugs</groupId>
+#             <artifactId>findsecbugs-plugin</artifactId>
+#             <version>1.14.0</version>
+#           </plugin>
+#         </plugins>
+#       </configuration>
+#     </plugin>
+#
+#   For Gradle, in build.gradle:
+#     spotbugs { ... }
+#     tasks.withType(com.github.spotbugs.snom.SpotBugsTask) {
+#       reports { sarif { required = true } }
+#     }
+#
+#   Plus a public repository, or GitHub Advanced Security on a private one,
+#   for the SARIF upload.
+#
+# WHAT IT PRODUCES
+#   - Alerts under Security -> Code scanning, categorised as `spotbugs`.
+#   - PMD findings as job annotations and a failing check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Both tools gain rules without this repository changing.
+    - cron: "31 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codequality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # maven | gradle
+  BUILD_TOOL: "maven"
+  WORKING_DIRECTORY: "."
+  DISTRIBUTION: "temurin"
+  JAVA_VERSION: "21"
+
+jobs:
+  spotbugs:
+    name: spotbugs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Writing the SARIF results as code scanning alerts.
+      security-events: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: ${{ env.BUILD_TOOL }}
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          validate-wrappers: true
+
+      - name: Run SpotBugs
+        id: lint
+        # The upload below has to happen even when the analysis fails,
+        # otherwise the findings that caused the failure never reach the
+        # security tab.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              # SpotBugs works on compiled classes, so the code has to be
+              # compiled first. `-DskipTests` because the tests are ci.yml's
+              # job and running them twice wastes several minutes.
+              $cmd --batch-mode --no-transfer-progress -DskipTests \
+                compile com.github.spotbugs:spotbugs-maven-plugin:check
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              $cmd --no-daemon spotbugsMain
+              ;;
+          esac
+
+      # SpotBugs writes one SARIF file per module, under target/ or build/.
+      # A multi-module project therefore produces several, and the upload
+      # action takes a directory.
+      - name: Collect the SARIF files
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p sarif
+          # -print0 and read -d so paths with spaces survive.
+          while IFS= read -r -d '' f; do
+            # Flatten the module path into the filename, so two modules'
+            # reports do not overwrite each other.
+            cp "$f" "sarif/$(echo "$f" | tr '/' '_')"
+          done < <(find . \
+            -path ./sarif -prune -o \
+            \( -name 'spotbugs*.sarif' -o -name 'spotbugsSarif*.json' -o -name 'main.sarif' \) \
+            -print0)
+          ls -l sarif || true
+          if [ -z "$(ls -A sarif 2>/dev/null)" ]; then
+            echo "::warning::No SpotBugs SARIF found. Is sarifOutput enabled in the build file? See this workflow's header."
+          fi
+
+      - name: Upload to code scanning
+        # An empty directory would fail the upload with a confusing message.
+        if: hashFiles('sarif/*') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ env.WORKING_DIRECTORY }}/sarif
+          category: spotbugs
+          wait-for-processing: true
+
+      - name: Fail if SpotBugs found anything
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "SpotBugs reported findings; see the Code scanning tab." >&2
+          exit 1
+
+  pmd:
+    name: pmd
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: ${{ env.BUILD_TOOL }}
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          validate-wrappers: true
+
+      # PMD does not emit SARIF, so its findings arrive as annotations and a
+      # failing check rather than as code scanning alerts. `pmd:check` fails
+      # on a violation; `pmd:pmd` only reports.
+      #
+      # `cpd-check` is the copy-paste detector, and is usually the more
+      # valuable half: duplicated blocks are where a bug gets fixed once and
+      # left in place twice.
+      - name: Run PMD
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              $cmd --batch-mode --no-transfer-progress \
+                org.apache.maven.plugins:maven-pmd-plugin:check \
+                org.apache.maven.plugins:maven-pmd-plugin:cpd-check
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              $cmd --no-daemon pmdMain cpdCheck || $cmd --no-daemon pmdMain
+              ;;
+          esac
+
+      - name: Keep the PMD reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pmd-reports
+          path: |
+            ${{ env.WORKING_DIRECTORY }}/**/target/pmd.xml
+            ${{ env.WORKING_DIRECTORY }}/**/target/cpd.xml
+            ${{ env.WORKING_DIRECTORY }}/**/build/reports/pmd/**
+          if-no-files-found: ignore
+          retention-days: 7
