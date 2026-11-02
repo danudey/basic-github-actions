@@ -1,0 +1,132 @@
+version: 2
+
+# A repository has exactly one .github/dependabot.yml, so this file is the
+# whole thing: the github-actions entry plus the Java one. Add further entries
+# for any other ecosystem in the repository rather than adding another file.
+#
+# WHICH ECOSYSTEM TO USE
+#   `maven` for a pom.xml project. `gradle` for build.gradle or
+#   build.gradle.kts. Both are below; delete the one that does not apply —
+#   leaving an entry with nothing to read is harmless but produces a
+#   Dependabot error on the repository's Insights page, which is noise.
+
+updates:
+  # The actions in .github/workflows. They are pinned to commit SHAs, which
+  # nothing updates on its own and which no human will notice has gone stale.
+  # Dependabot rewrites both the SHA and the version comment beside it.
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  # Maven. `directory` is where the parent pom.xml lives; Dependabot reads the
+  # module list from it, so a multi-module project needs one entry, not one
+  # per module. Delete this entry for a Gradle project.
+  - package-ecosystem: maven
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # "build" rather than "fix": a routine dependency bump should not by
+    # itself cut a release, and release-please keeps `build` out of the
+    # changelog. Change it to "fix" if you would rather every bump reach
+    # consumers as a patch release.
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      # Test and build tooling separately from what the artifact actually
+      # depends on. A JUnit or Mockito bump cannot affect a consumer; a
+      # runtime dependency bump can.
+      #
+      # Then runtime split again by update type, because in Java a major
+      # version bump is frequently a package rename (javax to jakarta, for
+      # instance) and belongs in its own reviewed pull request rather than
+      # blocking a batch of patches.
+      maven-test:
+        patterns:
+          - "org.junit*"
+          - "org.mockito*"
+          - "org.assertj*"
+          - "org.testcontainers*"
+          - "*:*-test"
+      maven-plugins:
+        patterns:
+          - "org.apache.maven.plugins:*"
+          - "com.github.spotbugs:*"
+          - "com.diffplug.spotless:*"
+      maven-runtime-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      maven-runtime-major:
+        patterns:
+          - "*"
+        update-types:
+          - major
+    labels:
+      - dependencies
+      - java
+    open-pull-requests-limit: 10
+    # Dependabot will not raise `maven.compiler.release`, and it should not:
+    # dropping a JDK is a decision about who you support. It will, though,
+    # happily bump a dependency that requires a newer JDK than you target,
+    # which is the usual cause of a Dependabot pull request that fails only
+    # on the oldest row of the CI matrix. Hold such a dependency back here:
+    #
+    # ignore:
+    #   - dependency-name: "com.example:library"
+    #     update-types: ["version-update:semver-major"]
+
+  # Gradle. Delete this entry for a Maven project.
+  #
+  # Note what it does and does not read: build.gradle, build.gradle.kts,
+  # gradle/libs.versions.toml (a version catalogue, which is the tidiest way
+  # to manage this) and gradle.lockfile. It does NOT update the Gradle
+  # distribution in gradle-wrapper.properties — run `./gradlew wrapper
+  # --gradle-version=X` for that, and commit the result.
+  #
+  # - package-ecosystem: gradle
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  #     day: monday
+  #     time: "06:00"
+  #     timezone: Etc/UTC
+  #   commit-message:
+  #     prefix: build
+  #     include: scope
+  #   groups:
+  #     gradle-all:
+  #       patterns:
+  #         - "*"
+  #   labels:
+  #     - dependencies
+  #     - java
+  #   open-pull-requests-limit: 10

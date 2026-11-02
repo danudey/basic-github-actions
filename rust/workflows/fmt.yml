@@ -1,0 +1,97 @@
+name: fmt
+
+# Catches formatting and tidiness problems that would otherwise arrive as
+# review comments. Kept separate from codequality.yml because a lint finding
+# needs a decision and a formatting finding needs one command.
+#
+# Checks rather than reformats. A workflow that pushes formatting commits back
+# to the branch fights the developer's editor and cannot work on a fork.
+#
+# WHAT TO CHANGE
+#   1. `WORKING_DIRECTORY`, if Cargo.toml is not at the repository root.
+#   2. `TOOLCHAIN`. rustfmt on nightly understands options stable rustfmt
+#      ignores (`group_imports`, `imports_granularity`). If rustfmt.toml uses
+#      any of those, set this to `nightly` — stable rustfmt silently ignores
+#      unknown options, so the check would pass while the file is unformatted.
+#   3. Delete the `docs` step if the crate has no documentation worth
+#      building. Keep it if it is published: `RUSTDOCFLAGS: -D warnings` turns
+#      a broken intra-doc link into a build failure, and a broken link on
+#      docs.rs is not fixable without a new release.
+#
+# WHAT IT NEEDS
+#   - Nothing. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check. Its log prints the diff and names the command to run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fmt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  TOOLCHAIN: "stable"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: rustfmt
+
+      - name: rustfmt
+        run: |
+          set -euo pipefail
+          if ! cargo fmt --all --check; then
+            echo "::error::Formatting is not clean. Run: cargo fmt --all"
+            exit 1
+          fi
+
+      # Cargo.toml itself. taplo is the TOML formatter the Rust ecosystem has
+      # settled on; a manifest with keys in arbitrary order and inconsistent
+      # array wrapping produces merge conflicts on every dependency bump.
+      # Delete this step if the project does not want an opinion about it.
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: taplo-cli
+
+      - name: taplo
+        run: |
+          set -euo pipefail
+          if ! taplo fmt --check --diff; then
+            echo "::error::TOML formatting is not clean. Run: taplo fmt"
+            exit 1
+          fi
+
+      # Rustdoc, with warnings as errors. A broken intra-doc link or an
+      # unresolved reference is invisible until somebody reads the published
+      # docs, and by then the only fix is another release.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: doc
+          workspaces: ${{ env.WORKING_DIRECTORY }}
+
+      - name: docs
+        run: cargo doc --locked --no-deps --all-features --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings

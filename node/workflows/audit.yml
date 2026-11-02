@@ -1,0 +1,155 @@
+name: audit
+
+# Asks whether anything the project already depends on is known to be
+# vulnerable today. Advisories are published without this repository changing,
+# so this runs on a schedule as well as on pull requests; GitHub emails the
+# repository owner when a scheduled workflow fails on the default branch.
+#
+# Two tools, because they disagree usefully:
+#
+#   npm/pnpm/yarn audit  the registry's own answer, from the GitHub Advisory
+#                        Database. Knows which version fixes each finding and
+#                        can distinguish a production dependency from a build
+#                        one. This is the gate.
+#
+#   osv-scanner          reads the lock file against OSV, which covers
+#                        advisories with no npm entry, and reports to the
+#                        security tab rather than failing the build.
+#
+# A NOTE ON `--omit=dev`
+#   The gate below audits production dependencies only. That is deliberate: a
+#   vulnerable dev dependency is a real risk to the machine that builds the
+#   code, but it is not shipped, and the npm dev tree is large enough that
+#   auditing all of it fails permanently and teaches everyone to ignore the
+#   check. The dev tree is still scanned by osv-scanner, where it produces an
+#   alert rather than a red build. If the project's build is itself
+#   security-sensitive, remove the flag.
+#
+# WHAT TO CHANGE
+#   1. `PACKAGE_MANAGER`: npm, pnpm or yarn.
+#   2. `WORKING_DIRECTORY`, if package.json is not at the repository root.
+#   3. `AUDIT_LEVEL`: the severity floor that fails the build. `high` is a
+#      reasonable start; `moderate` if the project ships to other people.
+#   4. The cron. Weekly is a reasonable default; daily if the project is
+#      something people deploy.
+#
+# WHAT IT NEEDS
+#   - A committed lock file. Without one there is nothing to audit.
+#   - A public repository, or GitHub Advanced Security, for the SARIF upload.
+#   - No secrets.
+#
+# WHAT IT PRODUCES
+#   - A failing check when a production dependency has a known vulnerability
+#     at or above AUDIT_LEVEL.
+#   - Alerts under Security -> Code scanning for everything OSV knows about.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Monday morning, off the top of the hour, which GitHub asks for.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # npm | pnpm | yarn
+  PACKAGE_MANAGER: "pnpm"
+  WORKING_DIRECTORY: "."
+  PNPM_VERSION: "10"
+  NODE_VERSION: "24"
+  # low | moderate | high | critical
+  AUDIT_LEVEL: "high"
+
+jobs:
+  registry-audit:
+    # A static name on purpose: the `env` context is not available in
+    # `jobs.<id>.name`, so interpolating PACKAGE_MANAGER here would render as
+    # an empty string.
+    name: registry audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: env.PACKAGE_MANAGER == 'pnpm'
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Audit
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm)
+              # Reads package-lock.json directly; no install needed.
+              npm audit --audit-level="${AUDIT_LEVEL}" --omit=dev
+              ;;
+            pnpm)
+              # pnpm needs a node_modules to resolve the tree, but
+              # --ignore-scripts means no dependency's install script runs,
+              # which is the whole point of not trusting the tree yet.
+              pnpm install --frozen-lockfile --ignore-scripts
+              pnpm audit --audit-level="${AUDIT_LEVEL}" --prod
+              ;;
+            yarn)
+              yarn install --immutable --mode=skip-build \
+                || yarn install --frozen-lockfile --ignore-scripts
+              # Yarn 2+ spells it `npm audit`; Yarn 1 spells it `audit`.
+              yarn npm audit --environment production --severity "${AUDIT_LEVEL}" \
+                || yarn audit --groups dependencies --level "${AUDIT_LEVEL}"
+              ;;
+            *)
+              echo "::error::PACKAGE_MANAGER must be npm, pnpm or yarn" >&2
+              exit 1
+              ;;
+          esac
+
+  osv-scanner:
+    name: osv-scanner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Finds package-lock.json, pnpm-lock.yaml and yarn.lock on its own, so
+      # it needs no PACKAGE_MANAGER branch. Unlike the gate above, it covers
+      # dev dependencies too.
+      - name: Scan the lock file
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        # Exits non-zero on any finding, and finding something in an npm tree
+        # is the normal state of affairs. The upload below is the deliverable.
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv-scanner.sarif
+            ./
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: osv-scanner.sarif
+          category: osv-scanner

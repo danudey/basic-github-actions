@@ -1,0 +1,91 @@
+version: 2
+
+# A repository has exactly one .github/dependabot.yml, so this file is the
+# whole thing: the github-actions entry plus the Cargo one. Add further
+# entries for any other ecosystem in the repository rather than adding
+# another file.
+
+updates:
+  # Keeps the actions in .github/workflows current. They are pinned to commit
+  # SHAs, which nothing updates on its own and which no human is going to
+  # notice has gone stale; Dependabot rewrites both the SHA and the version
+  # comment beside it, so the pin stays honest.
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # pr-title.yml requires a conventional commit title, and Dependabot's
+    # default ("Bump x from a to b") is not one, so every update would open a
+    # pull request that immediately fails its own check. This makes the titles
+    # read "ci(deps): bump ...".
+    commit-message:
+      prefix: ci
+      include: scope
+    # One pull request for all of them rather than one each. Actions bump
+    # often and independently; separate pull requests are pure noise.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  # The Cargo workspace. `directory` is where the top-level Cargo.toml lives;
+  # Dependabot reads the workspace members from it, so a workspace needs one
+  # entry, not one per member.
+  - package-ecosystem: cargo
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # "build" rather than "fix": a routine dependency bump should not by
+    # itself cut a release, and release-please keeps `build` out of the
+    # changelog. Change this to "fix" if you would rather every bump reach
+    # consumers as a patch release. Dependabot appends the scope itself, so
+    # these read "build(deps): bump ...".
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      # [dependencies] separately from [dev-dependencies]. A dev-dependency
+      # bump only touches tests and is almost always safe to merge unread; a
+      # runtime one ships to users and is worth a look, and mixing them means
+      # neither gets the attention it deserves. (Groups accept only
+      # `production` and `development` here, not `direct`/`indirect`; version
+      # updates touch direct dependencies only anyway.)
+      cargo-production:
+        dependency-type: production
+        patterns:
+          - "*"
+      cargo-development:
+        dependency-type: development
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - cargo
+    open-pull-requests-limit: 10
+    # Dependabot will not raise `rust-version` in Cargo.toml, and it should
+    # not: raising the MSRV is a decision about who you support. It will,
+    # however, happily bump a dependency whose own MSRV is higher than yours,
+    # which is the usual cause of a Dependabot pull request that fails only
+    # on the MSRV row of the CI matrix. Hold such a dependency back here:
+    #
+    # ignore:
+    #   - dependency-name: "some-crate"
+    #     update-types: ["version-update:semver-minor"]

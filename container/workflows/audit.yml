@@ -1,0 +1,165 @@
+name: audit
+
+# Asks whether the software inside the published image is patched today.
+#
+# This is a different question from the one CI answers, and it is the question
+# that matters most for a container. An image built two months ago has a
+# two-month-old base layer, and the base layer is where most of the CVEs are:
+# openssl, glibc, zlib, the distribution's own packages. Nothing in this
+# repository changes when one of those advisories is published, so this
+# workflow runs on a schedule and scans the image that is actually deployed.
+#
+# WHAT IT SCANS
+#   1. The published image at `IMAGE:latest` (or whatever TAG_TO_SCAN says).
+#      That is the artifact users pull, so it is the one whose CVE list is
+#      real. A scan of a freshly built image would miss exactly the drift this
+#      workflow exists to catch.
+#   2. On a pull request, the image built from the pull request instead, so a
+#      base image bump can be seen to have fixed something.
+#
+# WHAT TO CHANGE
+#   1. `IMAGE`. Defaults to ghcr.io/<owner>/<repo>, which is what release.yml
+#      publishes.
+#   2. `TAG_TO_SCAN`, if `latest` is not the tag people actually run.
+#   3. `SEVERITY`, the floor at which the job fails. HIGH,CRITICAL is a
+#      reasonable start. Setting it to MEDIUM on a distribution-based image
+#      means a permanently red check, which teaches everyone to ignore it.
+#   4. `.trivyignore` in the repository, for CVEs that are known and
+#      unfixable here — no upstream patch, or not reachable in this image.
+#      Put the reason and a review date beside each one.
+#   5. The cron. Daily is defensible for a container; the base layer changes
+#      under you whether or not you are looking.
+#
+# WHAT IT NEEDS
+#   - The image to exist. On the very first run, before release.yml has ever
+#     published, the scan will fail to pull; that is expected.
+#   - `packages: read` for a private GHCR image, which the job already has.
+#   - A public repository, or GitHub Advanced Security, for the SARIF upload.
+#
+# WHAT IT PRODUCES
+#   - A failing check when the published image has an unfixed vulnerability at
+#     or above SEVERITY that has a patched version available.
+#   - Alerts under Security -> Code scanning, categorised as `trivy-image`.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Daily. A container's dependency set decays whether or not anyone
+    # commits. Off the top of the hour, which GitHub asks for.
+    - cron: "27 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Lower-cased below: GHCR rejects an upper-case path, and GitHub owner and
+  # repository names may contain capitals.
+  IMAGE: ghcr.io/${{ github.repository }}
+  TAG_TO_SCAN: "latest"
+  SEVERITY: "HIGH,CRITICAL"
+  DOCKERFILE: "./Dockerfile"
+  BUILD_CONTEXT: "."
+
+jobs:
+  scan:
+    name: trivy (image)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Pulling the published image from GHCR when the package is private.
+      packages: read
+      # Writing the SARIF results as code scanning alerts.
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Normalise the image reference
+        id: ref
+        run: |
+          set -euo pipefail
+          # GHCR requires a lower-case path; repository names may not be.
+          echo "image=$(echo "${IMAGE}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # On a pull request, scan what the pull request would produce, so a base
+      # image bump can be seen to have fixed something. Everywhere else, scan
+      # what is actually published.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: github.event_name == 'pull_request'
+
+      - name: Build the pull request's image
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          push: false
+          load: true
+          tags: audit-target:pr
+          cache-from: type=gha
+
+      - name: Log in to the registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ github.event_name == 'pull_request' && 'audit-target:pr' || format('{0}:{1}', steps.ref.outputs.image, env.TAG_TO_SCAN) }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: ${{ env.SEVERITY }}
+          # Only report what can actually be fixed. An unfixed CVE with no
+          # upstream patch is not actionable, and a list full of them is a
+          # list nobody reads. Set to false before a compliance audit, where
+          # the unfixable ones have to be enumerated and accepted.
+          ignore-unfixed: true
+          # `library` finds vulnerabilities in the application's own
+          # dependencies (the Go modules, the npm tree) as well as in the
+          # operating system packages.
+          vuln-type: "os,library"
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+          wait-for-processing: true
+
+      # A second pass in table format, which fails the job. The SARIF pass
+      # above deliberately does not, so that the findings reach the security
+      # tab before anything exits non-zero.
+      - name: Fail on findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ github.event_name == 'pull_request' && 'audit-target:pr' || format('{0}:{1}', steps.ref.outputs.image, env.TAG_TO_SCAN) }}
+          format: table
+          severity: ${{ env.SEVERITY }}
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          exit-code: "1"
+          # The database was downloaded by the step above; skipping the
+          # update saves a minute and avoids a second rate-limited pull.
+          skip-setup-trivy: true
+          cache: "true"
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1

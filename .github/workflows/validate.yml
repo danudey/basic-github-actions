@@ -1,0 +1,154 @@
+name: validate
+
+# Lints and validates every workflow and Dependabot file in this repository:
+# the example ones under <language>/workflows and <language>/dependabot.yml,
+# and this repository's own .github/ configuration.
+#
+#   actionlint  correctness of every workflow, shellcheck over every `run:`.
+#   zizmor      security audit of every workflow and dependabot.yml.
+#   pinact      every `uses:` is pinned to a full SHA and its `# vX.Y.Z`
+#               comment names the version that SHA really is. Covers the
+#               snippets in the READMEs too.
+#   schemas     workflows and dependabot.yml against the SchemaStore schemas
+#               GitHub's own editor uses; the release-please config and
+#               manifest against release-please's schemas.
+#   yamllint    YAML syntax and style, configured in .yamllint.yml.
+#
+# Tool versions are pinned in .github/tools (go.mod and uv.lock) and kept
+# current by Dependabot.
+#
+# To run the same checks locally, see "Maintaining this repository" in the
+# top-level README.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/tools/go.mod
+          cache-dependency-path: .github/tools/go.sum
+
+      - name: Build actionlint
+        run: go build -C .github/tools -o "$RUNNER_TEMP/bin/" github.com/rhysd/actionlint/cmd/actionlint
+
+      # The format string turns each finding into a `::error` annotation on
+      # the offending line. shellcheck is preinstalled on ubuntu-latest, and
+      # actionlint runs it over every `run:` block.
+      - name: Lint every workflow
+        run: |
+          # The template is for actionlint, not the shell: no expansion wanted.
+          # shellcheck disable=SC2016
+          git ls-files -z '*/workflows/*.yml' \
+            | xargs -0 "$RUNNER_TEMP/bin/actionlint" -format \
+              '{{range $err := .}}::error file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}\n{{end}}'
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      # Files are passed explicitly: given a directory, zizmor only looks in
+      # .github/, and would skip the example workflows entirely.
+      - name: Audit every workflow and dependabot.yml
+        env:
+          # For the online audits: whether a pinned SHA belongs to the
+          # repository it claims to, and whether a referenced tag has moved.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git ls-files -z '*/workflows/*.yml' 'dependabot.yml' '*/dependabot.yml' \
+            | xargs -0 uv run --project .github/tools --frozen \
+              zizmor --format github --persona regular
+
+  pinact:
+    name: pinned actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/tools/go.mod
+          cache-dependency-path: .github/tools/go.sum
+
+      - name: Build pinact
+        run: go build -C .github/tools -o "$RUNNER_TEMP/bin/" github.com/suzuki-shunsuke/pinact/v5/cmd/pinact
+
+      # --check edits nothing and fails on any `uses:` that is not a full
+      # SHA. --verify-comment resolves each SHA through the API and fails if
+      # the `# vX.Y.Z` comment beside it names a different version — a pin
+      # whose comment lies is worse than no comment.
+      - name: Check every pin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git ls-files -z '*/workflows/*.yml' '*.md' \
+            | xargs -0 "$RUNNER_TEMP/bin/pinact" run --check --verify-comment
+
+  yaml:
+    name: schemas and yamllint
+    runs-on: ubuntu-latest
+    env:
+      # release-please's own schemas, at a fixed tag so the check does not
+      # change underneath a pull request.
+      RELEASE_PLEASE_SCHEMAS: https://raw.githubusercontent.com/googleapis/release-please/v17.11.2/schemas
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Workflows against the GitHub workflow schema
+        run: |
+          git ls-files -z '*/workflows/*.yml' \
+            | xargs -0 uv run --project .github/tools --frozen \
+              check-jsonschema --builtin-schema vendor.github-workflows
+
+      - name: dependabot.yml files against the Dependabot schema
+        run: |
+          git ls-files -z 'dependabot.yml' '*/dependabot.yml' \
+            | xargs -0 uv run --project .github/tools --frozen \
+              check-jsonschema --builtin-schema vendor.dependabot
+
+      - name: release-please config and manifest
+        run: |
+          git ls-files -z '*release-please-config.json' \
+            | xargs -0 uv run --project .github/tools --frozen \
+              check-jsonschema --schemafile "$RELEASE_PLEASE_SCHEMAS/config.json"
+          git ls-files -z '*.release-please-manifest.json' \
+            | xargs -0 uv run --project .github/tools --frozen \
+              check-jsonschema --schemafile "$RELEASE_PLEASE_SCHEMAS/manifest.json"
+
+      - name: yamllint
+        run: uv run --project .github/tools --frozen yamllint --strict --format github .

@@ -1,0 +1,221 @@
+name: CI
+
+# Builds and tests on every Node version and operating system the project
+# claims to support.
+#
+# All the Node workflows in this directory share one knob, PACKAGE_MANAGER,
+# and work with npm, pnpm or Yarn. The pattern is a `case` over the manager
+# that writes `$RUN` and `$EXEC` into the environment; every later step uses
+# `$RUN test` rather than hard-coding `npm run` or `pnpm`.
+#
+# WHAT TO CHANGE
+#   1. `PACKAGE_MANAGER`: npm, pnpm or yarn. It has to match the lock file in
+#      the repository — package-lock.json, pnpm-lock.yaml or yarn.lock. If
+#      package.json has a `packageManager` field, match that instead and
+#      Corepack will enforce it.
+#   2. `WORKING_DIRECTORY`, if package.json is not at the repository root.
+#   3. The `node` matrix. Every version the project supports, which should
+#      match the `engines.node` range in package.json. Nothing checks that
+#      agreement for you, and a version in `engines` but not here is the
+#      usual source of "it does not work on Node 20".
+#   4. The script names in the steps below (`build`, `test`, `typecheck`).
+#      Delete a step if package.json has no such script; a missing script is
+#      a hard failure, not a skip.
+#
+# WHAT IT NEEDS
+#   - A committed lock file. Every install below uses the frozen-lockfile mode
+#     of its manager, so a missing or stale lock fails rather than quietly
+#     resolving something new. That is deliberate: the alternative is testing
+#     a dependency set nobody reviewed.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check per Node version and operating system.
+#   - A coverage artifact from the Linux, newest-Node run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # npm | pnpm | yarn
+  PACKAGE_MANAGER: "pnpm"
+  WORKING_DIRECTORY: "."
+  PNPM_VERSION: "10"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash on Windows too, so one `case` statement covers every runner.
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+        # Even-numbered Node releases are the LTS ones. Testing an odd
+        # release is only worth it if you intend to support it.
+        node: ["20", "22", "24"]
+        # The full matrix on Linux; only the newest elsewhere. Delete this to
+        # test everything everywhere, at roughly three times the minutes.
+        exclude:
+          - { os: macos-latest, node: "20" }
+          - { os: macos-latest, node: "22" }
+          - { os: windows-latest, node: "20" }
+          - { os: windows-latest, node: "22" }
+          - { os: ubuntu-24.04-arm, node: "20" }
+          - { os: ubuntu-24.04-arm, node: "22" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # pnpm has to be on PATH before setup-node runs, because setup-node's
+      # cache resolution asks pnpm where its store is.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: env.PACKAGE_MANAGER == 'pnpm'
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          # Caches the manager's own store, keyed off the lock file. Naming
+          # the lock file explicitly is what makes it work when package.json
+          # is not at the repository root.
+          cache: ${{ env.PACKAGE_MANAGER }}
+          cache-dependency-path: ${{ env.WORKING_DIRECTORY }}/${{ env.PACKAGE_MANAGER == 'npm' && 'package-lock.json' || env.PACKAGE_MANAGER == 'pnpm' && 'pnpm-lock.yaml' || 'yarn.lock' }}
+
+      # One place that knows how each manager installs and how it runs a
+      # script. $RUN and $EXEC are exported to every later step through
+      # $GITHUB_ENV.
+      - name: Install
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm)
+              # `ci` rather than `install`: it installs exactly the lock file
+              # and errors if package.json disagrees with it.
+              npm ci
+              echo "RUN=npm run" >> "$GITHUB_ENV"
+              echo "EXEC=npx --no-install" >> "$GITHUB_ENV"
+              ;;
+            pnpm)
+              pnpm install --frozen-lockfile
+              echo "RUN=pnpm run" >> "$GITHUB_ENV"
+              echo "EXEC=pnpm exec" >> "$GITHUB_ENV"
+              ;;
+            yarn)
+              # Yarn 1 does not understand --immutable; Yarn 2+ does, and
+              # `--frozen-lockfile` is the Yarn 1 spelling. Try the modern
+              # flag first.
+              yarn install --immutable || yarn install --frozen-lockfile
+              echo "RUN=yarn run" >> "$GITHUB_ENV"
+              echo "EXEC=yarn exec" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::PACKAGE_MANAGER must be npm, pnpm or yarn" >&2
+              exit 1
+              ;;
+          esac
+
+      # A type check is not a lint: it finds real defects. It lives here
+      # rather than in codequality.yml because its answer can depend on the
+      # Node version's own type definitions.
+      - name: Type check
+        run: $RUN typecheck --if-present
+
+      - name: Build
+        run: $RUN build --if-present
+
+      - name: Test
+        run: $RUN test
+
+      - name: Keep the coverage report
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: ${{ env.WORKING_DIRECTORY }}/coverage/
+          # A project with no coverage output should not fail the job.
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Packs the tarball npm would publish and looks inside it. Catches the
+  # `files` field that excludes the built output, and the build artefact that
+  # was never committed or generated — both of which install cleanly and then
+  # fail on import. Worth running on every pull request, because the release
+  # is a bad moment to discover it.
+  pack:
+    name: pack the tarball
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: env.PACKAGE_MANAGER == 'pnpm'
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: ${{ env.PACKAGE_MANAGER }}
+          cache-dependency-path: ${{ env.WORKING_DIRECTORY }}/${{ env.PACKAGE_MANAGER == 'npm' && 'package-lock.json' || env.PACKAGE_MANAGER == 'pnpm' && 'pnpm-lock.yaml' || 'yarn.lock' }}
+
+      - name: Install and build
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm)  npm ci ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --immutable || yarn install --frozen-lockfile ;;
+          esac
+          npm run build --if-present
+
+      - name: Pack and inspect
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination .
+          # A glob rather than `ls`, so a filename with a space or a newline
+          # in it cannot split into two words.
+          tarballs=(./*.tgz)
+          tarball="${tarballs[0]}"
+          echo "Contents of ${tarball}:"
+          tar tzf "$tarball"
+          # A tarball with nothing but package.json in it is the failure this
+          # step exists to catch.
+          count=$(tar tzf "$tarball" | grep -cv '/$')
+          echo "${count} files"
+          if [ "$count" -lt 2 ]; then
+            echo "::error::The published tarball contains almost nothing. Check the 'files' field in package.json."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarball
+          path: ${{ env.WORKING_DIRECTORY }}/*.tgz
+          retention-days: 7

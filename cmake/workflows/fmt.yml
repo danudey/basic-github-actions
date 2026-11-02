@@ -1,0 +1,128 @@
+name: fmt
+
+# Catches formatting problems in the source and in the build files. Kept
+# separate from codequality.yml because a lint finding needs a decision and a
+# formatting finding needs one command.
+#
+# Checks rather than reformats. A workflow that pushes formatting commits back
+# to the branch fights the developer's editor and cannot work on a fork.
+#
+# WHAT TO CHANGE
+#   1. `CHECK_PATH`: which directory to format-check. Point it at your own
+#      source; running clang-format over vendored third-party code produces a
+#      diff you must not commit.
+#   2. `CLANG_FORMAT_VERSION`. Pin it. clang-format's output changes between
+#      major versions, so a floating version means CI and the developer's
+#      editor disagree about the same file and the check becomes noise. Keep
+#      this equal to whatever `.clang-format` was written against.
+#   3. `.clang-format` in the repository. Without one, clang-format falls back
+#      to LLVM style, which is probably not what the project uses. Generate a
+#      starting point with:
+#        clang-format --style=llvm --dump-config > .clang-format
+#   4. Delete the `cmake-format` step if the project does not want an opinion
+#      about CMakeLists.txt layout.
+#
+# WHAT IT NEEDS
+#   - A `.clang-format`. Without it the check enforces a style nobody chose.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check. Its log prints the diff and names the command to run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fmt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Your own source. Not the repository root if third-party code is vendored.
+  CHECK_PATH: "src"
+  CLANG_FORMAT_VERSION: "20"
+
+jobs:
+  clang-format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+        # Deliberately not `submodules: recursive`. Vendored code is not ours
+        # to reformat, and checking it out would only produce findings that
+        # must be ignored.
+
+      - name: clang-format
+        uses: jidicula/clang-format-action@654a770daa28443dd111d133e4083e21c1075674 # v4.18.0
+        with:
+          clang-format-version: ${{ env.CLANG_FORMAT_VERSION }}
+          check-path: ${{ env.CHECK_PATH }}
+          # Falls back to LLVM style if there is no .clang-format, rather than
+          # silently passing. Set to `file` explicitly once you have one.
+          fallback-style: LLVM
+
+      # Also check any other source roots. The action above takes one path, so
+      # add a step per directory: include/, tests/, examples/.
+      - name: clang-format (include)
+        if: hashFiles('include/**') != ''
+        uses: jidicula/clang-format-action@654a770daa28443dd111d133e4083e21c1075674 # v4.18.0
+        with:
+          clang-format-version: ${{ env.CLANG_FORMAT_VERSION }}
+          check-path: include
+          fallback-style: LLVM
+
+  cmake-format:
+    name: cmake-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      # cmake-format ships as a Python package (cmakelang), so uvx runs it
+      # without a virtualenv to manage. Configured by .cmake-format.yaml if
+      # one exists.
+      - name: cmake-format
+        run: |
+          set -euo pipefail
+          # Every CMake file that is ours, excluding build directories and
+          # anything vendored.
+          mapfile -t files < <(
+            git ls-files '*.cmake' 'CMakeLists.txt' '**/CMakeLists.txt' \
+              | grep -vE '^(build|out|third_party|vendor|extern)/' || true
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no CMake files to check"
+            exit 0
+          fi
+          printf 'checking %d files\n' "${#files[@]}"
+          if ! uvx --from cmakelang cmake-format --check "${files[@]}"; then
+            echo "::error::CMake formatting is not clean. Run: uvx --from cmakelang cmake-format -i <files>"
+            exit 1
+          fi
+
+      # cmake-lint is the same package's linter: it catches a `set()` in a
+      # function that should have been `PARENT_SCOPE`, an undocumented cache
+      # variable, a target name that does not follow the project's convention.
+      # Advisory rather than gating, because its defaults are strict.
+      - name: cmake-lint
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            git ls-files '*.cmake' 'CMakeLists.txt' '**/CMakeLists.txt' \
+              | grep -vE '^(build|out|third_party|vendor|extern)/' || true
+          )
+          [ "${#files[@]}" -eq 0 ] && exit 0
+          uvx --from cmakelang cmake-lint "${files[@]}"

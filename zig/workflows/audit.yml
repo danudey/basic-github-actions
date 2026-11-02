@@ -1,0 +1,170 @@
+name: audit
+
+# Dependency auditing for Zig, which is genuinely worse served than the other
+# languages here. Worth being explicit about the gap rather than shipping a
+# workflow that looks reassuring and checks nothing.
+#
+# WHAT DOES NOT EXIST
+#   - There is no advisory database for Zig packages. No `zig audit`, no
+#     RustSec equivalent, no OSV ecosystem. osv-scanner does not parse
+#     build.zig.zon.
+#   - Dependabot has no Zig ecosystem, so nothing opens a pull request when a
+#     dependency in build.zig.zon gets a new release.
+#
+# WHAT THIS WORKFLOW CHECKS INSTEAD
+#   1. Every dependency in build.zig.zon has a content hash. Zig verifies the
+#      hash on fetch, so a hashed dependency cannot be swapped out under you —
+#      a URL without one can. This is the single most valuable check here.
+#   2. Every dependency URL points somewhere you meant. A `git+https` to a
+#      personal fork, or a tarball from a URL that is not a release artifact,
+#      is worth knowing about.
+#   3. That `zig build --fetch` still resolves. A dependency whose tarball has
+#      been deleted or retagged breaks every fresh clone, and this is where to
+#      find that out rather than from a new contributor.
+#   4. Vendored C dependencies, if the project has any, against OSV. That part
+#      does work: osv-scanner understands the C/C++ manifests a Zig project
+#      commonly vendors, and Trivy's filesystem scan will match known library
+#      versions found in the tree.
+#
+# WHAT TO CHANGE
+#   1. `ZIG_VERSION`. Keep it equal to the one in ci.yml.
+#   2. `WORKING_DIRECTORY`, if build.zig.zon is not at the repository root.
+#   3. The cron. Weekly is enough given how little there is to check.
+#   4. Delete the `vendored` job if the project vendors nothing.
+#
+# WHAT IT NEEDS
+#   - A public repository, or GitHub Advanced Security, for the SARIF upload
+#     in the `vendored` job.
+#   - No secrets.
+#
+# WHAT IT PRODUCES
+#   - A failing check when a dependency is unhashed or no longer fetchable.
+#   - Alerts under Security -> Code scanning for anything found in vendored
+#     third-party source.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Monday morning, off the top of the hour, which GitHub asks for.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  dependencies:
+    name: dependency hygiene
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: true
+
+      # A dependency with a URL and no hash is fetched and trusted blind: the
+      # tarball at that URL can change and nothing notices. Zig verifies a
+      # hash when one is present, so this check is what makes the manifest
+      # worth anything as a supply-chain control.
+      - name: Every dependency is hashed
+        run: |
+          set -euo pipefail
+          if [ ! -f build.zig.zon ]; then
+            echo "no build.zig.zon; nothing to check"
+            exit 0
+          fi
+
+          # Count URL entries and hash entries. A `.path` dependency is local
+          # and needs no hash, so those are excluded from the URL count.
+          urls=$(grep -cE '^\s*\.url\s*=' build.zig.zon || true)
+          hashes=$(grep -cE '^\s*\.hash\s*=' build.zig.zon || true)
+          echo "${urls} remote dependencies, ${hashes} hashes"
+
+          if [ "$urls" -gt "$hashes" ]; then
+            echo "::error::A dependency in build.zig.zon has a URL but no hash. Run 'zig fetch --save <url>' to add one."
+            grep -nE '^\s*\.(url|hash)\s*=' build.zig.zon
+            exit 1
+          fi
+          echo "all remote dependencies are hashed"
+
+      # Prints the dependency URLs into the log. Not a pass/fail check — there
+      # is no list of blessed hosts to compare against — but it is how anyone
+      # notices that a dependency now points at a personal fork.
+      - name: Where the dependencies come from
+        run: |
+          set -euo pipefail
+          if [ -f build.zig.zon ]; then
+            echo "Dependency sources:"
+            grep -E '^\s*\.url\s*=' build.zig.zon | sed 's/^[[:space:]]*//' || echo "  (none)"
+          fi
+
+      # A dependency whose tarball has been deleted or retagged breaks every
+      # fresh clone. Better to find that out on a schedule than from a new
+      # contributor.
+      - name: Dependencies still resolve
+        run: |
+          set -euo pipefail
+          # An empty global cache, so this genuinely re-fetches rather than
+          # reading what an earlier run left behind.
+          if ! zig build --fetch --global-cache-dir "$(mktemp -d)"; then
+            echo "::error::A dependency in build.zig.zon could not be fetched. Something upstream has moved or been deleted."
+            exit 1
+          fi
+          echo "all dependencies resolved"
+
+  # Vendored third-party source, which is where a Zig project's real
+  # dependency risk usually lives: a copy of zlib, sqlite or libcurl in the
+  # tree, pinned by nothing and updated by nobody. Delete this job if the
+  # project vendors nothing.
+  vendored:
+    name: vendored source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Trivy's filesystem scan identifies bundled library versions from their
+      # own headers and version files, so it finds a vendored zlib even with
+      # no manifest to read. This is the only tool here that says anything
+      # useful about vendored C in a Zig project.
+      - name: Scan for known vulnerable bundled libraries
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          scanners: vuln,secret
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs

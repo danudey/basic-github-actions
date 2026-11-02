@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "CHANGE-ME",
+
+      "//": [
+        "The changelog sections. A type with `hidden: true` still counts",
+        "towards the version bump but does not appear in the changelog, which",
+        "is what keeps a hundred Dependabot commits out of the release notes.",
+        "Keep this list in step with pr-title.yml's `task_types`, or a title",
+        "that passes the check can produce a commit release-please ignores."
+      ],
+      "changelog-sections": [
+        { "type": "feat", "section": "Features" },
+        { "type": "fix", "section": "Bug Fixes" },
+        { "type": "perf", "section": "Performance" },
+        { "type": "revert", "section": "Reverts" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "refactor", "section": "Refactoring", "hidden": true },
+        { "type": "test", "section": "Tests", "hidden": true },
+        { "type": "build", "section": "Build System", "hidden": true },
+        { "type": "ci", "section": "CI", "hidden": true },
+        { "type": "chore", "section": "Miscellaneous", "hidden": true }
+      ],
+
+      "//extra-files": [
+        "Uncomment and adapt for a version string release-please cannot find",
+        "on its own. Each named file needs the marker comment on the version",
+        "line: # x-release-please-version"
+      ],
+      "extra-files": [],
+
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "draft": false,
+      "prerelease": false
+    }
+  }
+}

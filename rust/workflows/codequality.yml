@@ -1,0 +1,128 @@
+name: codequality
+
+# Static analysis, reported as code scanning alerts rather than as a wall of
+# text in a log.
+#
+# Clippy's JSON output is converted to SARIF by `clippy-sarif` and uploaded to
+# the Code scanning tab, so each finding becomes an alert with a location, a
+# rule, and a history: it appears when introduced, closes when fixed, and can
+# be dismissed with a reason. That is the difference between a linter people
+# act on and one people mute.
+#
+# WHAT TO CHANGE
+#   1. `WORKING_DIRECTORY`, if Cargo.toml is not at the repository root.
+#   2. The `[lints.clippy]` table in Cargo.toml. That is where the value is;
+#      this workflow only runs clippy. A reasonable starting point:
+#        [lints.clippy]
+#        all = { level = "warn", priority = -1 }
+#        pedantic = { level = "warn", priority = -1 }
+#        unwrap_used = "warn"
+#        expect_used = "warn"
+#        panic = "warn"
+#      Putting it in Cargo.toml rather than in this file's flags means
+#      developers see the same lints locally.
+#   3. `TOOLCHAIN`. Clippy gains lints with each release, so a floating
+#      `stable` can turn a green main branch red with no commit behind it.
+#      Pin it to an exact version if that matters more than currency.
+#
+# WHAT IT NEEDS
+#   - A public repository, or GitHub Advanced Security on a private one, for
+#     the SARIF upload.
+#
+# WHAT IT PRODUCES
+#   - Alerts under Security -> Code scanning, categorised as `clippy`.
+#   - A failing job when a finding exists, so it blocks the pull request
+#     rather than only being recorded.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # New lints land in clippy without this repository changing.
+    - cron: "31 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codequality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  TOOLCHAIN: "stable"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Writing the SARIF results as code scanning alerts.
+      security-events: write
+      # Alert deduplication reads the run metadata.
+      actions: read
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: clippy
+          workspaces: ${{ env.WORKING_DIRECTORY }}
+
+      # cargo-binstall first, then the two converters through it. Neither is
+      # carried by taiki-e/install-action, and `cargo install` would compile
+      # both from source on every run — a couple of minutes for a step that
+      # only reformats JSON. binstall fetches the prebuilt binaries from
+      # sarif-rs's own release page instead, in seconds.
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-binstall
+
+      - name: Install the SARIF converters
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo binstall --no-confirm --locked clippy-sarif sarif-fmt
+
+      # `tee` keeps the SARIF for the upload while `sarif-fmt` renders the
+      # same findings into the log, so the run is not silent. Note that
+      # `pipefail` is not set: the pipeline's exit status has to come from
+      # sarif-fmt, and clippy's own non-zero status is re-asserted at the end
+      # of the job so the upload happens first.
+      - name: Run clippy
+        id: lint
+        continue-on-error: true
+        run: |
+          cargo clippy \
+            --locked --all-features --all-targets --workspace \
+            --message-format=json \
+            | clippy-sarif | tee clippy.sarif | sarif-fmt
+          exit "${PIPESTATUS[0]}"
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ env.WORKING_DIRECTORY }}/clippy.sarif
+          category: clippy
+          wait-for-processing: true
+
+      # Re-asserts the clippy result after the upload, so a finding both
+      # appears as an alert and blocks the pull request.
+      - name: Fail if clippy found anything
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "clippy reported findings; see the Code scanning tab." >&2
+          exit 1

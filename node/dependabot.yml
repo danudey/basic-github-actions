@@ -1,0 +1,96 @@
+version: 2
+
+# A repository has exactly one .github/dependabot.yml, so this file is the
+# whole thing: the github-actions entry plus the npm one. Add further entries
+# for any other ecosystem in the repository rather than adding another file.
+#
+# The ecosystem is called `npm` regardless of which manager the project uses.
+# It reads package.json plus whichever of package-lock.json, pnpm-lock.yaml
+# and yarn.lock it finds, and updates the lock file in place.
+
+updates:
+  # The actions in .github/workflows. They are pinned to commit SHAs, which
+  # nothing updates on its own and which no human will notice has gone stale.
+  # Dependabot rewrites both the SHA and the version comment beside it.
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  - package-ecosystem: npm
+    directory: /
+    # For a workspace/monorepo, list every package directory rather than
+    # relying on Dependabot to find them:
+    # directories:
+    #   - /
+    #   - /packages/*
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # "build" rather than "fix": a routine dependency bump should not by
+    # itself cut a release, and release-please keeps `build` out of the
+    # changelog. Change it to "fix" if you would rather every bump reach
+    # consumers as a patch release.
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      # An npm tree is large enough that ungrouped updates are unmanageable.
+      #
+      # Development tooling is grouped and merged largely unread: a prettier
+      # or vitest bump cannot affect a user. Runtime dependencies are split
+      # again by update type, because a patch is a patch and a major is a
+      # migration, and putting them in one pull request means the migration
+      # blocks the patches.
+      npm-dev:
+        dependency-type: development
+        patterns:
+          - "*"
+      npm-runtime-minor:
+        dependency-type: production
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      npm-runtime-major:
+        dependency-type: production
+        patterns:
+          - "*"
+        update-types:
+          - major
+    labels:
+      - dependencies
+      - javascript
+    open-pull-requests-limit: 10
+    # Dependabot will not raise `engines.node`, and it should not: dropping a
+    # Node version is a decision about who you support.
+    #
+    # To hold a dependency back, uncomment and name it:
+    # ignore:
+    #   - dependency-name: "typescript"
+    #     update-types: ["version-update:semver-minor"]

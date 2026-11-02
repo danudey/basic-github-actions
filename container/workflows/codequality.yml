@@ -1,0 +1,139 @@
+name: codequality
+
+# Static analysis of the Dockerfile and of the Kubernetes, Terraform and
+# Compose files beside it, reported as code scanning alerts.
+#
+# Two tools:
+#
+#   hadolint   Dockerfile correctness and style. Catches `apt-get install`
+#              without `--no-install-recommends` or a cleanup, a `latest` base
+#              image, `ADD` where `COPY` was meant, a missing `USER` so
+#              everything runs as root, and a shell pipeline whose failure is
+#              silently swallowed. This is the closest thing a container
+#              repository has to a format check, which is why there is no
+#              separate fmt.yml in this directory.
+#
+#   trivy      misconfiguration scanning across the whole repository:
+#              Dockerfile, Compose, Kubernetes manifests, Helm charts,
+#              Terraform. Finds a privileged container, a hostPath mount, a
+#              missing resource limit, an unencrypted bucket.
+#
+# Image vulnerability scanning is a different question — "is the software in
+# this image patched today" — and lives in audit.yml, on a schedule.
+#
+# WHAT TO CHANGE
+#   1. `DOCKERFILE`, if it is not ./Dockerfile. For several Dockerfiles, turn
+#      the hadolint job into a matrix over their paths.
+#   2. `.hadolint.yaml` in the repository, for rules that do not apply. The
+#      usual first entry is `DL3008` (pin apt versions), which is good advice
+#      and impractical on Debian.
+#   3. `trivy-config.yaml`, or the `skip-dirs` input, if the scan is picking
+#      up vendored third-party manifests you do not control.
+#
+# WHAT IT NEEDS
+#   - A public repository, or GitHub Advanced Security on a private one, for
+#     the SARIF uploads.
+#   - No secrets.
+#
+# WHAT IT PRODUCES
+#   - Alerts under Security -> Code scanning, in two categories: `hadolint`
+#     and `trivy-config`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Both tools gain rules without this repository changing.
+    - cron: "31 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codequality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKERFILE: "./Dockerfile"
+
+jobs:
+  hadolint:
+    name: hadolint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Writing the SARIF results as code scanning alerts.
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        id: lint
+        # The upload below has to happen even when the lint fails, otherwise
+        # the findings that caused the failure never reach the security tab.
+        continue-on-error: true
+        with:
+          dockerfile: ${{ env.DOCKERFILE }}
+          format: sarif
+          output-file: hadolint.sarif
+          # Style findings are advisory; anything at warning or above fails.
+          failure-threshold: warning
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+          wait-for-processing: true
+
+      - name: Fail if hadolint found anything
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "hadolint reported findings; see the Code scanning tab." >&2
+          exit 1
+
+  trivy-config:
+    name: trivy (misconfiguration)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan the configuration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          # `config` rather than `fs`: this looks for misconfiguration, not
+          # for vulnerable packages. Package scanning is audit.yml's job.
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-config.sarif
+          # MEDIUM and below in a config scan is mostly advice about labels
+          # and naming, and it buries the findings that matter.
+          severity: HIGH,CRITICAL
+          # Nothing under here is ours to fix.
+          skip-dirs: "vendor,node_modules,third_party"
+        env:
+          # The action pulls its vulnerability and policy databases from a
+          # container registry, which is rate-limited for anonymous pulls.
+          # These mirror them through GitHub's registry instead.
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+          wait-for-processing: true

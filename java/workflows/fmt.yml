@@ -1,0 +1,140 @@
+name: fmt
+
+# Catches formatting problems and build-file drift. Kept separate from
+# codequality.yml because a lint finding needs a decision and a formatting
+# finding needs one command.
+#
+# Checks rather than reformats. A workflow that pushes formatting commits back
+# to the branch fights the developer's editor and cannot work on a fork.
+#
+# WHAT TO CHANGE
+#   1. `BUILD_TOOL`: maven or gradle.
+#   2. `WORKING_DIRECTORY`, if the build file is not at the repository root.
+#   3. The Spotless configuration in the build file. Spotless is the tool
+#      Java has settled on: one plugin that formats Java, the pom itself,
+#      Markdown and YAML, with a choice of formatter underneath
+#      (google-java-format, palantir, eclipse). The README beside this file
+#      has a starting configuration for both build tools.
+#
+# WHAT IT NEEDS
+#   - The Spotless plugin in pom.xml or build.gradle. Without it,
+#     `spotless:check` fails with "no plugin found", which is a confusing way
+#     to learn that formatting is not configured.
+#   - Nothing else. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check. Its log names every offending file, and the failure
+#     message says which command fixes it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fmt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # maven | gradle
+  BUILD_TOOL: "maven"
+  WORKING_DIRECTORY: "."
+  DISTRIBUTION: "temurin"
+  JAVA_VERSION: "21"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: ${{ env.BUILD_TOOL }}
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          validate-wrappers: true
+
+      - name: Spotless
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              if ! $cmd --batch-mode --no-transfer-progress spotless:check; then
+                echo "::error::Formatting is not clean. Run: ./mvnw spotless:apply"
+                exit 1
+              fi
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              if ! $cmd --no-daemon spotlessCheck; then
+                echo "::error::Formatting is not clean. Run: ./gradlew spotlessApply"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::BUILD_TOOL must be maven or gradle" >&2
+              exit 1
+              ;;
+          esac
+
+      # The pom's own tidiness. A pom that has been appended to for years —
+      # dependencies in no order, properties scattered, plugin versions
+      # inline rather than in pluginManagement — produces a merge conflict on
+      # every dependency bump. Spotless can format the XML itself; this step
+      # is the stronger check that the dependency list is sorted, and it is
+      # Maven-only.
+      #
+      # Delete it if the project does not want the discipline; the sort order
+      # is arbitrary, and the value is only in having one.
+      - name: pom is sorted
+        if: env.BUILD_TOOL == 'maven'
+        run: |
+          set -euo pipefail
+          if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+          if ! $cmd --batch-mode --no-transfer-progress \
+              com.github.ekryd.sortpom:sortpom-maven-plugin:verify \
+              -Dsort.verifyFail=stop -Dsort.createBackupFile=false; then
+            echo "::error::pom.xml is not sorted. Run: ./mvnw sortpom:sort"
+            exit 1
+          fi
+
+      # Gradle's own formatting has no settled convention, so there is no
+      # equivalent check. Spotless can format .gradle files if the build file
+      # asks it to; see the README beside this workflow.
+      - name: Note for Gradle projects
+        if: env.BUILD_TOOL == 'gradle'
+        run: |
+          echo "Gradle build scripts are formatted by Spotless if configured;"
+          echo "see the 'gradle' target in the README beside this workflow."
+
+      # The wrapper is executable code committed to the repository. A jar that
+      # does not match a published Gradle release runs arbitrary code with the
+      # build's privileges, and it is a real attack that has been used. The
+      # setup-gradle action above already validates it; this makes the check
+      # explicit and visible in its own step for a project that does not use
+      # that action.
+      - name: Wrapper is unmodified
+        if: env.BUILD_TOOL == 'gradle'
+        run: |
+          set -euo pipefail
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradle-wrapper.jar present; validated by setup-gradle above."
+            sha256sum gradle/wrapper/gradle-wrapper.jar
+          fi

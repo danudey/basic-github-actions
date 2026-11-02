@@ -1,0 +1,107 @@
+name: fmt
+
+# `zig fmt` is not configurable. There is one correct formatting of a Zig
+# file, the compiler ships the formatter, and nobody has a style opinion to
+# argue about — which makes this the cheapest useful check in this directory.
+#
+# Checks rather than reformats. A workflow that pushes formatting commits back
+# to the branch fights the developer's editor and cannot work on a fork.
+#
+# WHAT TO CHANGE
+#   1. `ZIG_VERSION`. Keep it equal to the one in ci.yml: the formatter's
+#      output changes between Zig releases, so two versions in one repository
+#      means the check and the developer's editor disagree.
+#   2. `EXCLUDE`, for vendored or generated Zig. `zig fmt` has no ignore file,
+#      so exclusions have to be passed as paths.
+#
+# WHAT IT NEEDS
+#   - Nothing. No secrets.
+#
+# WHAT IT PRODUCES
+#   - One status check. Its log names every offending file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fmt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  ZIG_VERSION: "0.15.2"
+  # Space-separated directories to leave alone. `zig fmt` has no ignore file.
+  EXCLUDE: "vendor deps zig-out .zig-cache"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: true
+
+      # `--check` lists the files that would change and exits non-zero if
+      # there are any. Passing explicit exclusions rather than `.` because
+      # `zig fmt` will happily reformat a vendored dependency.
+      - name: zig fmt
+        run: |
+          set -euo pipefail
+          args=(--check)
+          for d in ${EXCLUDE}; do
+            args+=(--exclude "$d")
+          done
+          if ! zig fmt "${args[@]}" .; then
+            echo "::error::Formatting is not clean. Run: zig fmt ."
+            exit 1
+          fi
+          echo "zig fmt: clean"
+
+      # `zig fmt --ast-check` additionally parses each file and reports a
+      # syntax error that the formatter would otherwise pass through. Cheap,
+      # and it catches a broken file that is never referenced from build.zig
+      # and so is never compiled.
+      - name: AST check
+        run: |
+          set -euo pipefail
+          args=(--ast-check)
+          for d in ${EXCLUDE}; do
+            args+=(--exclude "$d")
+          done
+          zig fmt "${args[@]}" .
+          # --ast-check rewrites files it can fix, so anything changed here
+          # is a file that was not formatted. The step above should have
+          # caught it; this is the belt to that braces.
+          git diff --exit-code || {
+            echo "::error::Files changed during the AST check. Run: zig fmt ."
+            exit 1
+          }
+
+      # build.zig.zon's own formatting. It is Zig syntax, so `zig fmt` handles
+      # it, but it lives outside the source tree walk on some layouts.
+      - name: build.zig.zon
+        run: |
+          set -euo pipefail
+          if [ -f build.zig.zon ]; then
+            zig fmt --check build.zig.zon || {
+              echo "::error::build.zig.zon is not formatted. Run: zig fmt build.zig.zon"
+              exit 1
+            }
+          else
+            echo "no build.zig.zon; skipping"
+          fi

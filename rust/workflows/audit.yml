@@ -1,0 +1,149 @@
+name: audit
+
+# Asks whether anything the project already depends on is known to be
+# vulnerable, unmaintained, or licensed in a way you have not agreed to.
+# Advisories appear without this repository changing, so this runs on a
+# schedule as well as on pull requests; GitHub emails the repository owner
+# when a scheduled workflow fails on the default branch.
+#
+# Three tools, because they answer three questions:
+#
+#   cargo audit   is anything in Cargo.lock in the RustSec advisory database.
+#                 Also reports `unmaintained` and `unsound` notices, which are
+#                 not vulnerabilities but are the early warning for one.
+#
+#   cargo deny    everything else about the dependency graph: licences you
+#                 have not allowed, a crate pulled in from an unexpected
+#                 registry or git remote, three incompatible versions of the
+#                 same crate linked into one binary. Configured in deny.toml.
+#
+#   osv-scanner   the same lock file against OSV, which carries advisories
+#                 with no RustSec entry. Reports to the security tab rather
+#                 than failing the build.
+#
+# WHAT TO CHANGE
+#   1. `WORKING_DIRECTORY`, if Cargo.toml is not at the repository root.
+#   2. `deny.toml` in the repository. cargo-deny does nothing useful without
+#      it; `cargo deny init` writes a starting point. The `[licenses]` and
+#      `[bans]` sections are the two worth reading.
+#   3. `.cargo/audit.toml`, for advisories that are known and unfixable here.
+#      Put the reason beside each ignored ID — an unexplained ignore entry
+#      outlives the problem it was added for.
+#   4. The cron. Weekly is a reasonable default; daily if the project is
+#      something people deploy.
+#
+# WHAT IT NEEDS
+#   - A committed Cargo.lock. Without one there is nothing to audit.
+#   - A public repository, or GitHub Advanced Security, for the SARIF upload.
+#   - No secrets.
+#
+# WHAT IT PRODUCES
+#   - A failing check when an advisory applies, or when a dependency breaks a
+#     rule in deny.toml.
+#   - Alerts under Security -> Code scanning for everything OSV knows about.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Monday morning, off the top of the hour, which GitHub asks for.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKING_DIRECTORY: "."
+  TOOLCHAIN: "stable"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-audit
+
+      # `--deny warnings` fails on the unmaintained and unsound notices too,
+      # not just on vulnerabilities. That is the useful setting: an
+      # unmaintained crate is a vulnerability with a longer fuse. Advisories
+      # that are genuinely unfixable here belong in .cargo/audit.toml, with a
+      # comment saying why.
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # One job per check, so "a GPL dependency appeared" and "there are now
+      # three versions of `rand` in the tree" are separate red checks rather
+      # than one that has to be read to find out which.
+      matrix:
+        check:
+          - advisories
+          - bans
+          - licenses
+          - sources
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check ${{ matrix.check }}
+          manifest-path: ${{ env.WORKING_DIRECTORY }}/Cargo.toml
+          # The advisories check reads a database that changes daily, so a
+          # cached result would defeat the point of the scheduled run.
+          command-arguments: "--hide-inclusion-graph"
+
+  osv-scanner:
+    name: osv-scanner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan Cargo.lock
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        # Exits non-zero on any finding. cargo-audit above is the gate; this
+        # is the wider net, and the upload below is its deliverable.
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv-scanner.sarif
+            ./
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: osv-scanner.sarif
+          category: osv-scanner

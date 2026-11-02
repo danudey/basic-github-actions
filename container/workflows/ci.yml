@@ -1,0 +1,132 @@
+name: CI
+
+# Builds the image for every architecture it will be published for, without
+# pushing anything.
+#
+# The point is to fail on a pull request rather than mid-release. A Dockerfile
+# that builds on amd64 and not on arm64 is common — an apt package with no
+# arm64 build, a downloaded binary with a hard-coded architecture in its URL,
+# a base image that only has one arch — and the release workflow is a bad
+# place to discover it.
+#
+# HOW THE ARCHITECTURES WORK
+#   `docker buildx build --platform linux/amd64,linux/arm64` on an amd64
+#   runner emulates arm64 through QEMU. Correct, and very slow: an emulated
+#   compile can be ten times the native time. So this workflow fans the
+#   platforms out across native runners instead — `ubuntu-latest` for amd64,
+#   `ubuntu-24.04-arm` for arm64 — one job each, in parallel. release.yml
+#   does the same and then stitches the results into one multi-arch manifest.
+#
+#   QEMU is still set up, because a Dockerfile with a `--platform` cross-build
+#   stage in it needs it even on a native runner.
+#
+# WHAT TO CHANGE
+#   1. `DOCKERFILE` and `BUILD_CONTEXT`, if they are not ./Dockerfile and the
+#      repository root.
+#   2. The `platform` matrix. Every platform you intend to publish. A platform
+#      here with no native runner falls back to emulation, which works but is
+#      slow enough to notice.
+#   3. `BUILD_ARGS`, for anything the Dockerfile needs at build time. Never
+#      put a secret in one: build args are recorded in the image history and
+#      readable by anyone who pulls it. Use `secrets:` on the build step for
+#      that.
+#
+# WHAT IT NEEDS
+#   - A Dockerfile. Nothing else, and no secrets: nothing is pushed.
+#
+# WHAT IT PRODUCES
+#   - One status check per platform.
+#   - A smoke-test result: the image is actually run, because an image that
+#     builds and then exits 1 on start is not a passing build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKERFILE: "./Dockerfile"
+  BUILD_CONTEXT: "."
+  # Newline-separated `KEY=value` pairs. Not for secrets.
+  BUILD_ARGS: ""
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            # A native arm64 runner. Free on public repositories, and roughly
+            # ten times faster than emulating arm64 on an amd64 runner.
+            runner: ubuntu-24.04-arm
+          # Uncomment for the less common architectures. These have no native
+          # runner, so they build under QEMU and are slow:
+          # - platform: linux/arm/v7
+          #   runner: ubuntu-latest
+          # - platform: linux/ppc64le
+          #   runner: ubuntu-latest
+          # - platform: linux/s390x
+          #   runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Needed even on a native runner if the Dockerfile has a cross-building
+      # stage of its own.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ env.BUILD_ARGS }}
+          push: false
+          # Loads the built image into the runner's local Docker, so the smoke
+          # test below can run it. Only possible for a single platform at a
+          # time, which is another reason this workflow fans out rather than
+          # building a multi-platform manifest in one job.
+          load: true
+          tags: ci-build:test
+          # A registry-backed cache shared with the release build, so a
+          # release does not recompile what a pull request already built.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # An image that builds and then fails to start is not a passing build,
+      # and this is the cheapest place to find that out. Replace the command
+      # with whatever the image's own health check would be — `--version`,
+      # `--help`, a config validation subcommand.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run --rm ci-build:test --version \
+            || docker run --rm ci-build:test --help \
+            || {
+              echo "::error::The image built but would not run. Neither --version nor --help succeeded."
+              exit 1
+            }
+
+      # Reports the final image size. Not a pass/fail check — a size limit
+      # that fails a build is usually more annoying than useful — but it puts
+      # the number in the log, which is how anyone notices a base image change
+      # that added 400MB.
+      - name: Image size
+        run: docker image inspect ci-build:test --format '{{.Size}} bytes, {{len .RootFS.Layers}} layers'

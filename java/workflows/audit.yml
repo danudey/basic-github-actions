@@ -1,0 +1,238 @@
+name: audit
+
+# Asks whether anything the project already depends on is known to be
+# vulnerable today. Advisories are published without this repository changing,
+# so this runs on a schedule as well as on pull requests; GitHub emails the
+# repository owner when a scheduled workflow fails on the default branch.
+#
+# Java's problem is not a shortage of tools, it is transitive depth. A Spring
+# or Jakarta application resolves several hundred jars from a dozen direct
+# dependencies, and the vulnerable one is almost always something nobody
+# chose. Two tools, because they read the tree differently:
+#
+#   osv-scanner   reads pom.xml and Gradle's lock or verification metadata
+#                 against OSV. Fast, no build required, no API key.
+#
+#   Trivy         resolves the full transitive tree from the build file and
+#                 matches it against the GitHub Advisory Database. Slower,
+#                 more thorough on transitive dependencies, and it reports
+#                 which direct dependency pulled the vulnerable one in —
+#                 which is the piece of information you actually need to fix
+#                 it.
+#
+# WHAT ABOUT OWASP DEPENDENCY-CHECK
+#   It is the traditional answer and it is a poor fit for CI now: it needs an
+#   NVD API key, downloads a multi-gigabyte database, and takes ten minutes on
+#   a cold cache. If a compliance process requires its report specifically,
+#   there is a commented job at the bottom of this file. Otherwise the two
+#   above cover the same ground faster.
+#
+# WHAT TO CHANGE
+#   1. `BUILD_TOOL`: maven or gradle.
+#   2. `WORKING_DIRECTORY`, if the build file is not at the repository root.
+#   3. `SEVERITY`, the floor at which Trivy fails the build.
+#   4. `.trivyignore`, for findings that are known and unfixable here. Put the
+#      reason and a review date beside each one.
+#   5. The cron. Weekly is a reasonable default; daily if the project is
+#      something people deploy.
+#
+# WHAT IT NEEDS
+#   - A public repository, or GitHub Advanced Security, for the SARIF uploads.
+#   - No secrets, unless you enable the dependency-check job.
+#
+# WHAT IT PRODUCES
+#   - A failing check when a dependency has a known vulnerability at or above
+#     SEVERITY.
+#   - Alerts under Security -> Code scanning, in the `osv-scanner` and
+#     `trivy-java` categories.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Monday morning, off the top of the hour, which GitHub asks for.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # maven | gradle
+  BUILD_TOOL: "maven"
+  WORKING_DIRECTORY: "."
+  DISTRIBUTION: "temurin"
+  JAVA_VERSION: "21"
+  SEVERITY: "HIGH,CRITICAL"
+
+jobs:
+  osv-scanner:
+    name: osv-scanner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Finds pom.xml, gradle.lockfile and
+      # gradle/verification-metadata.xml on its own, so it needs no
+      # BUILD_TOOL branch. A Gradle project with neither of the latter two
+      # gives it much less to work with, which is a good reason to enable
+      # dependency locking.
+      - name: Scan the manifests
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        # Exits non-zero on any finding, and finding something in a
+        # several-hundred-jar tree is the normal state of affairs. Trivy
+        # below is the gate; this is the wider net.
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv-scanner.sarif
+            ./
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: osv-scanner.sarif
+          category: osv-scanner
+
+  trivy:
+    name: trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.DISTRIBUTION }}
+          cache: ${{ env.BUILD_TOOL }}
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: env.BUILD_TOOL == 'gradle'
+        with:
+          validate-wrappers: true
+
+      # Trivy resolves a Maven tree by reading pom.xml and walking the
+      # repository, but it cannot resolve a Gradle tree without help. Writing
+      # the resolved dependencies out first gives it something exact to read,
+      # and is the difference between scanning the declared dependencies and
+      # scanning what actually gets linked.
+      - name: Resolve the dependency tree
+        run: |
+          set -euo pipefail
+          case "$BUILD_TOOL" in
+            maven)
+              if [ -x ./mvnw ]; then cmd="./mvnw"; else cmd="mvn"; fi
+              # Populates the local repository so Trivy sees the real
+              # resolved versions rather than the ranges in the pom.
+              $cmd --batch-mode --no-transfer-progress \
+                dependency:go-offline -DskipTests
+              ;;
+            gradle)
+              if [ -x ./gradlew ]; then cmd="./gradlew"; else cmd="gradle"; fi
+              # A lockfile if the project has locking configured; a plain
+              # dependency report otherwise. Neither is required for the scan
+              # to run, hence the `|| true`.
+              $cmd --no-daemon dependencies --write-locks || true
+              ;;
+          esac
+
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.WORKING_DIRECTORY }}
+          format: sarif
+          output: trivy-java.sarif
+          severity: ${{ env.SEVERITY }}
+          scanners: vuln
+          # Only what can actually be fixed. An unfixed advisory with no
+          # upstream release is not actionable, and a list full of them is a
+          # list nobody reads.
+          ignore-unfixed: true
+        env:
+          # The action pulls its databases from a container registry, which is
+          # rate-limited for anonymous pulls. These mirror them through
+          # GitHub's registry instead.
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-java.sarif
+          category: trivy-java
+
+      # A second pass in table format, which fails the job. The SARIF pass
+      # above deliberately does not, so the findings reach the security tab
+      # before anything exits non-zero.
+      - name: Fail on findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.WORKING_DIRECTORY }}
+          format: table
+          severity: ${{ env.SEVERITY }}
+          scanners: vuln
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+          cache: "true"
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+
+  # OWASP dependency-check, for a compliance process that requires its report
+  # specifically. Uncomment the job, and set NVD_API_KEY as a repository
+  # secret — request one at https://nvd.nist.gov/developers/request-an-api-key.
+  # Without a key the NVD download is rate-limited to the point of taking
+  # forty minutes.
+  #
+  # dependency-check:
+  #   name: owasp dependency-check
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #     - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+  #       with:
+  #         java-version: "21"
+  #         distribution: temurin
+  #         cache: maven
+  #     # The NVD database is several gigabytes and changes slowly, so caching
+  #     # it is what makes this job tolerable at all.
+  #     - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+  #       with:
+  #         path: ~/.m2/repository/org/owasp/dependency-check-data
+  #         key: dependency-check-nvd-${{ github.run_id }}
+  #         restore-keys: dependency-check-nvd-
+  #     - name: Run dependency-check
+  #       run: |
+  #         ./mvnw --batch-mode --no-transfer-progress \
+  #           org.owasp:dependency-check-maven:check \
+  #           -DnvdApiKey="${NVD_API_KEY}" \
+  #           -DfailBuildOnCVSS=7
+  #       env:
+  #         NVD_API_KEY: ${{ secrets.NVD_API_KEY }}

@@ -1,0 +1,139 @@
+name: codequality
+
+# Static analysis, reported as code scanning alerts rather than as a wall of
+# text in a log.
+#
+# ESLint's SARIF output goes to the Code scanning tab, so each finding becomes
+# an alert with a location, a rule, and a history: it appears when introduced,
+# closes when fixed, and can be dismissed with a reason. That is the
+# difference between a linter people act on and one people mute.
+#
+# ESLint does not ship a SARIF formatter, so `@microsoft/eslint-formatter-sarif`
+# is installed for the run. It is the formatter GitHub's own documentation
+# uses.
+#
+# WHAT TO CHANGE
+#   1. `PACKAGE_MANAGER`: npm, pnpm or yarn.
+#   2. `WORKING_DIRECTORY`, if package.json is not at the repository root.
+#   3. `LINT_PATHS`: what to lint. `.` with a flat config
+#      (eslint.config.js) is usually right; older `.eslintrc` setups often
+#      need explicit paths and `--ext`.
+#   4. ESLint itself, in eslint.config.js. That configuration is where the
+#      value is; this workflow only runs it. `typescript-eslint`'s
+#      `recommendedTypeChecked` config is the single biggest upgrade for a
+#      TypeScript project, and needs `parserOptions.projectService: true`.
+#
+# WHAT IT NEEDS
+#   - ESLint as a devDependency, with a config file. This workflow does not
+#     install ESLint itself; it uses the project's version, which is the only
+#     way the result matches what a developer sees locally.
+#   - A public repository, or GitHub Advanced Security on a private one, for
+#     the SARIF upload.
+#
+# WHAT IT PRODUCES
+#   - Alerts under Security -> Code scanning, categorised as `eslint`.
+#   - A failing job when a finding exists, so it blocks the pull request
+#     rather than only being recorded.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Rules land in the plugins without this repository changing.
+    - cron: "31 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codequality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # npm | pnpm | yarn
+  PACKAGE_MANAGER: "pnpm"
+  WORKING_DIRECTORY: "."
+  PNPM_VERSION: "10"
+  NODE_VERSION: "24"
+  LINT_PATHS: "."
+
+jobs:
+  eslint:
+    name: eslint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Writing the SARIF results as code scanning alerts.
+      security-events: write
+      # Alert deduplication reads the run metadata.
+      actions: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: env.PACKAGE_MANAGER == 'pnpm'
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: ${{ env.PACKAGE_MANAGER }}
+          cache-dependency-path: ${{ env.WORKING_DIRECTORY }}/${{ env.PACKAGE_MANAGER == 'npm' && 'package-lock.json' || env.PACKAGE_MANAGER == 'pnpm' && 'pnpm-lock.yaml' || 'yarn.lock' }}
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          case "$PACKAGE_MANAGER" in
+            npm)  npm ci ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --immutable || yarn install --frozen-lockfile ;;
+          esac
+
+      # Installed here rather than added to package.json, because it is a CI
+      # concern and nobody needs it locally. `--no-save` on npm keeps the
+      # lock file untouched, which matters: a modified lock file would make
+      # the frozen install above a lie on the next step.
+      - name: Install the SARIF formatter
+        run: npm install --no-save @microsoft/eslint-formatter-sarif@3.1.0 # zizmor: ignore[adhoc-packages] exact version, CI-only tool
+
+      - name: Run ESLint
+        id: lint
+        # The upload below has to happen even when the lint fails, otherwise
+        # the findings that caused the failure never reach the security tab.
+        # The job is still failed, by the explicit check at the end.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Two passes over the same code: one for the machine, one for the
+          # log a human reads. ESLint is fast enough that this is free, and
+          # the alternative is a silent run.
+          # LINT_PATHS unquoted on purpose: it is a space-separated list
+          # of paths, not a single path.
+          # shellcheck disable=SC2086
+          npx eslint ${LINT_PATHS} \
+            --format @microsoft/eslint-formatter-sarif \
+            --output-file eslint.sarif || true
+          # shellcheck disable=SC2086
+          npx eslint ${LINT_PATHS} --format stylish
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ env.WORKING_DIRECTORY }}/eslint.sarif
+          category: eslint
+          wait-for-processing: true
+
+      - name: Fail if ESLint found anything
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "ESLint reported findings; see the Code scanning tab." >&2
+          exit 1

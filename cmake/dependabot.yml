@@ -1,0 +1,108 @@
+version: 2
+
+# A repository has exactly one .github/dependabot.yml, so this file is the
+# whole thing.
+#
+# WHAT DEPENDABOT CAN AND CANNOT DO FOR C AND C++
+#   There is no `cmake` ecosystem, and no `vcpkg` or `conan` one either. What
+#   is supported:
+#
+#     github-actions   the workflows. Covered below.
+#     gitsubmodule     every submodule, bumped to its upstream default
+#                      branch's tip. This is the important one for a C or C++
+#                      project, because vendored submodules are where the
+#                      dependency risk lives and nothing else will move them.
+#     docker           the base image in a Dockerfile, if there is one.
+#
+#   What is not supported, and what to do instead:
+#
+#     vcpkg            vcpkg.json has no Dependabot support. Pin the registry
+#                      with a `builtin-baseline` commit and raise it
+#                      deliberately; `vcpkg x-update-baseline` does the edit.
+#     Conan            conanfile.txt likewise. `conan graph outdated` reports
+#                      what has moved.
+#     FetchContent     a `GIT_TAG` in CMakeLists.txt is invisible to
+#                      Dependabot. Pin it to a commit SHA rather than a
+#                      branch, and raise it by hand. Renovate does support
+#                      this pattern with a regex manager, and is the tool to
+#                      reach for if it matters.
+#
+#   audit.yml beside this file reports how far behind each submodule is, which
+#   is the visibility Dependabot cannot give you for the rest.
+
+updates:
+  # The actions in .github/workflows. They are pinned to commit SHAs, which
+  # nothing updates on its own and which no human will notice has gone stale.
+  # Dependabot rewrites both the SHA and the version comment beside it.
+  - package-ecosystem: github-actions
+    # For this ecosystem "/" means .github/workflows, not the repository root.
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  # Every git submodule, bumped to its upstream default branch. Note what that
+  # means: not to the latest tag, but to the tip of the default branch,
+  # whatever state that is in. For a well-run upstream that is fine. For one
+  # that commits directly to main, it is a stream of pull requests you will
+  # want to review rather than merge unread — which is why the interval here
+  # is monthly rather than weekly.
+  #
+  # It is still much better than the alternative, which is a submodule pinned
+  # to a 2019 commit that nobody has looked at since.
+  - package-ecosystem: gitsubmodule
+    directory: /
+    # Wait a week before proposing a new release: most malicious or broken
+    # releases are caught and yanked within days. Security updates ignore it.
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # "build": a vendored dependency bump usually does need a rebuild and a
+    # test run, but it should not by itself cut a release.
+    commit-message:
+      prefix: build
+      include: scope
+    labels:
+      - dependencies
+      - submodules
+    # Deliberately low. Each of these needs a real review.
+    open-pull-requests-limit: 3
+    # To leave a submodule alone entirely — a fork you maintain, or a vendored
+    # copy that is deliberately frozen:
+    #
+    # ignore:
+    #   - dependency-name: "third_party/our-fork-of-something"
+
+  # Uncomment if the project ships a Dockerfile. See container/dependabot.yml
+  # in this library for the full version with its reasoning.
+  #
+  # - package-ecosystem: docker
+  #   directory: /
+  #   schedule:
+  #     interval: daily
+  #   commit-message:
+  #     prefix: fix
+  #     include: scope
+  #   labels:
+  #     - dependencies
+  #     - docker
