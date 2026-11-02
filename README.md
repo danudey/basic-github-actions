@@ -190,3 +190,52 @@ passes both at their strictest settings. To check locally:
 actionlint .github/workflows/*.yml
 uvx zizmor --collect all .
 ```
+
+## Maintaining this repository
+
+This repository's own CI lives in `.github/` and does two jobs.
+
+**`validate.yml`** runs on every pull request and every push to `main`. It
+checks every example workflow, every example `dependabot.yml`, the
+release-please files, and `.github/` itself:
+
+| check | what fails it |
+|---|---|
+| actionlint | invalid workflow syntax or expressions; shellcheck findings in `run:` blocks |
+| zizmor | security findings (injection, permissions, credential persistence, …) |
+| pinact | a `uses:` not pinned to a full SHA, or a `# vX.Y.Z` comment that does not match its SHA (README snippets included) |
+| check-jsonschema | a workflow, `dependabot.yml`, or release-please file that does not match its schema |
+| yamllint | YAML syntax or style, per `.yamllint.yml` |
+
+**`update-example-pins.yml`** runs every Monday and opens one pull request that
+moves every pin in `<language>/workflows/` and the README snippets to the
+latest release at least 7 days old. Dependabot cannot do this: it only reads
+`.github/workflows`. Dependabot handles `.github/` and the tool versions in
+`.github/tools/` instead.
+
+One-time setup for the updater:
+
+1. Settings → Actions → General → turn on **Allow GitHub Actions to create and
+   approve pull requests**.
+2. Optional: create a GitHub App with Contents and Pull requests read/write,
+   install it on this repository, and set the `PIN_UPDATER_APP_ID` variable
+   and `PIN_UPDATER_APP_KEY` secret. Without it, the pull request is opened
+   with `GITHUB_TOKEN`, and `validate` does not run on it until you push to
+   the branch or close and reopen the pull request.
+
+To run the checks locally (needs Go and uv; the tool versions come from
+`.github/tools/`):
+
+```sh
+go build -C .github/tools -o "$PWD/.bin/" \
+  github.com/rhysd/actionlint/cmd/actionlint \
+  github.com/suzuki-shunsuke/pinact/v5/cmd/pinact
+export GITHUB_TOKEN=$(gh auth token) GH_TOKEN=$(gh auth token)
+
+git ls-files -z '*/workflows/*.yml' | xargs -0 .bin/actionlint
+git ls-files -z '*/workflows/*.yml' 'dependabot.yml' '*/dependabot.yml' \
+  | xargs -0 uv run --project .github/tools --frozen zizmor
+git ls-files -z '*/workflows/*.yml' '*.md' \
+  | xargs -0 .bin/pinact run --check --verify-comment
+uv run --project .github/tools --frozen yamllint --strict .
+```

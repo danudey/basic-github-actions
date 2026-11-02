@@ -170,7 +170,7 @@ jobs:
       # Node 20 is old enough to lack it on some releases. Pinned rather than
       # @latest so the tool holding the publish token is a reviewed version.
       - name: Update npm
-        run: npm install --global npm@12.2.1
+        run: npm install --global npm@12.2.1 # zizmor: ignore[adhoc-packages] exact version, see above
 
       - name: Publish
         run: |

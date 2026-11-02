@@ -103,7 +103,7 @@ jobs:
       # lock file untouched, which matters: a modified lock file would make
       # the frozen install above a lie on the next step.
       - name: Install the SARIF formatter
-        run: npm install --no-save @microsoft/eslint-formatter-sarif@3.1.0
+        run: npm install --no-save @microsoft/eslint-formatter-sarif@3.1.0 # zizmor: ignore[adhoc-packages] exact version, CI-only tool
 
       - name: Run ESLint
         id: lint

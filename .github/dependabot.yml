@@ -1,0 +1,72 @@
+version: 2
+
+# Dependabot for this repository's own CI — the files under .github/.
+#
+# It does NOT update the example workflows under <language>/workflows/:
+# Dependabot's github-actions ecosystem only reads .github/workflows and
+# action.yml files. Those pins are kept current by
+# .github/workflows/update-example-pins.yml instead.
+
+updates:
+  # The live workflows in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  # pinact and actionlint, pinned as Go tool dependencies.
+  - package-ecosystem: gomod
+    directory: /.github/tools
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      go-tools:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci
+
+  # check-jsonschema, yamllint and zizmor, locked in uv.lock.
+  - package-ecosystem: uv
+    directory: /.github/tools
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      python-tools:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci

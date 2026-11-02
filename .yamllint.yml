@@ -1,0 +1,28 @@
+# yamllint configuration for every YAML file in this repository: the example
+# workflows, the example dependabot.yml files, and .github/ itself.
+#
+# Run locally with:
+#   uv run --project .github/tools --frozen yamllint --strict .
+
+extends: default
+
+ignore: |
+  .venv/
+  .github/tools/.venv/
+
+rules:
+  # The workflows carry long explanatory comments and long `run:` lines;
+  # wrapping them hurts more than it helps.
+  line-length: disable
+  # GitHub Actions uses `on:` as a key, which YAML 1.1 reads as a boolean.
+  truthy:
+    check-keys: false
+  document-start: disable
+  # `{ key: value }` flow mappings are written with inner spaces here.
+  braces:
+    max-spaces-inside: 1
+  comments:
+    min-spaces-from-content: 1
+  # Commented-out example blocks are indented to where they would go once
+  # uncommented, not to the surrounding content.
+  comments-indentation: disable

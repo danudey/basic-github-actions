@@ -1,0 +1,3 @@
+# Local builds of the tools in .github/tools.
+.bin/
+.venv/

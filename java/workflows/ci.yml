@@ -169,9 +169,13 @@ jobs:
   #
   # Delete this job if the project is not aiming at reproducible builds — but
   # read it first, because the fix is usually two properties in the pom.
+  #
+  # Off until the project is configured for it: set the repository variable
+  # REPRODUCIBLE_BUILD to `true` (Settings -> Secrets and variables ->
+  # Actions -> Variables) to turn it on.
   reproducible:
     name: reproducible build check
-    if: false # set to `true` once the project is configured for it
+    if: vars.REPRODUCIBLE_BUILD == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
