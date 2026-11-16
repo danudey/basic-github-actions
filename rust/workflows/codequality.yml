@@ -88,7 +88,7 @@ jobs:
       # both from source on every run — a couple of minutes for a step that
       # only reformats JSON. binstall fetches the prebuilt binaries from
       # sarif-rs's own release page instead, in seconds.
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-binstall
 
@@ -113,7 +113,7 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Upload to code scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: ${{ env.WORKING_DIRECTORY }}/clippy.sarif
           category: clippy
