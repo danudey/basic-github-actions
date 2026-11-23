@@ -71,7 +71,7 @@ jobs:
       # settled on; a manifest with keys in arbitrary order and inconsistent
       # array wrapping produces merge conflicts on every dependency bump.
       # Delete this step if the project does not want an opinion about it.
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: taplo-cli
 

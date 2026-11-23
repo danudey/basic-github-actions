@@ -113,13 +113,13 @@ jobs:
       # A current CMake and Ninja on every runner. The version preinstalled on
       # the GitHub images lags, and a `cmake_minimum_required` above it fails
       # the configure step with a message that does not say so clearly.
-      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+      - uses: lukka/get-cmake@16e8153a8b4918849d92aad131befe67a3705daa # v4.5.0
 
       # Caches the compiler's object files across runs, keyed off the compiler
       # and build type. On a large C++ project this is the difference between
       # a twenty-minute build and a two-minute one, and it is the single
       # biggest win available in a C++ CI.
-      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
         with:
           key: ${{ matrix.runner }}-${{ matrix.cc || 'msvc' }}-${{ matrix.build_type }}
           # Enough for a mid-sized C++ project's object files.
@@ -178,9 +178,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+      - uses: lukka/get-cmake@16e8153a8b4918849d92aad131befe67a3705daa # v4.5.0
 
-      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
         with:
           key: sanitizer-${{ matrix.sanitizer }}
           max-size: 500M
