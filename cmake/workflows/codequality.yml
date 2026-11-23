@@ -80,7 +80,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
+      - uses: lukka/get-cmake@16e8153a8b4918849d92aad131befe67a3705daa # v4.5.0
 
       # clang-tidy needs to know how each file is compiled — the include
       # paths, the defines, the standard. CMAKE_EXPORT_COMPILE_COMMANDS
@@ -110,7 +110,7 @@ jobs:
       # YAML output into SARIF. Rust is preinstalled on the GitHub Ubuntu
       # images, so this needs no toolchain step, and binstall pulls a prebuilt
       # binary rather than compiling it.
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-binstall
 
@@ -142,7 +142,7 @@ jobs:
           test "$(python3 -c 'import json,sys; print(sum(len(r["results"]) for r in json.load(open("clang-tidy.sarif"))["runs"]))')" = "0"
 
       - name: Upload to code scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: clang-tidy.sarif
           category: clang-tidy
@@ -221,7 +221,7 @@ jobs:
         # cppcheck writes SARIF to stderr, so an empty file means it did not
         # run rather than that it found nothing. Guard the upload.
         if: hashFiles('cppcheck.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: cppcheck.sarif
           category: cppcheck

@@ -79,7 +79,7 @@ jobs:
         with:
           toolchain: ${{ env.TOOLCHAIN }}
 
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-audit
 
@@ -110,7 +110,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           command: check ${{ matrix.check }}
           manifest-path: ${{ env.WORKING_DIRECTORY }}/Cargo.toml
@@ -131,7 +131,7 @@ jobs:
           persist-credentials: false
 
       - name: Scan Cargo.lock
-        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
         # Exits non-zero on any finding. cargo-audit above is the gate; this
         # is the wider net, and the upload below is its deliverable.
         continue-on-error: true
@@ -143,7 +143,7 @@ jobs:
             ./
 
       - name: Upload to code scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: osv-scanner.sarif
           category: osv-scanner
